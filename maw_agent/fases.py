@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import re
 from pathlib import Path
 
 from . import (achados, alvos, build, catalogo, config, estado, preflight, sandbox, saude, suite)
@@ -29,25 +30,48 @@ def _alvos(e: estado.Estado, so: str | None = None) -> list[dict]:
 
 def achado_de_build(alvo: dict, r: dict) -> dict:
     cfg = r["config"]
+    obtido = ("; ".join(r["erros"][:5]) if r["erros"] else
+              f"o build falhou sem mensagem de erro reconhecível; ver o log {Path(r['log']).name}")
     return {"titulo": f"Build {cfg} de {alvo['nome']} não compila", "tipo": "erro", "severidade": "critica",
             "prioridade": None, "alvos": [{"alvo": alvo["nome"], "commit": alvo["commit"]}],
             "item_catalogo": f"saude/build-{cfg.lower()}", "principio": "P14",
             "passos": [f"msbuild Builds\\VisualStudio2022\\MAW_APP_App.vcxproj /p:Configuration={cfg} /p:Platform=x64"],
-            "esperado": "compilação sem erros", "obtido": "; ".join(r["erros"][:5]),
+            "esperado": "compilação sem erros", "obtido": obtido,
             "evidencias": [{"arquivo": r["log"], "legenda": "log do MSBuild", "embutir": False}],
             "causa_provavel": None, "sugestao": "corrigir os erros de compilação listados",
             "criterio_aceite": f"o build {cfg} compila sem erros", "confianca": "confirmado",
             "assinatura": f"build:{cfg}:" + (r["erros"][0] if r["erros"] else "sem-erro"), "fonte": "build"}
 
 
+_RX_DETALHE_CABECALHO = re.compile(r"^-\s*(.+?)\s+/\s+(.+?)\s*$")
+
+
+def _detalhes_por_bloco(detalhes: list[str]) -> dict[tuple[str, str], list[str]]:
+    """Agrupa as linhas de 'Detalhe das falhas' pelo cabeçalho ('- <nome> / <sub>') que as antecede,
+    para que o achado de um bloco não carregue as mensagens de outro bloco."""
+    out: dict[tuple[str, str], list[str]] = {}
+    atual: tuple[str, str] | None = None
+    for linha in detalhes:
+        m = _RX_DETALHE_CABECALHO.match(linha)
+        if m:
+            atual = (m.group(1), m.group(2))
+            out.setdefault(atual, [])
+        elif atual is not None:
+            out[atual].append(linha)
+    return out
+
+
 def achados_da_suite(alvo: dict, r: dict) -> list[dict]:
+    evidencia_suite = {"arquivo": f"suites/{alvo['nome']}.json", "legenda": "relatório completo da suíte",
+                       "embutir": False}
     base = {"prioridade": None, "alvos": [{"alvo": alvo["nome"], "commit": alvo["commit"]}],
-            "evidencias": [], "causa_provavel": None, "confianca": "confirmado", "fonte": "suite",
+            "evidencias": [evidencia_suite], "causa_provavel": None, "confianca": "confirmado", "fonte": "suite",
             "passos": ["MAW_APP.exe --run-tests (build Debug)"]}
     out = []
+    detalhes_por_bloco = _detalhes_por_bloco(r.get("detalhes", []))
     for b in r["blocos"]:
         if b["falhas"]:
-            det = [d for d in r.get("detalhes", []) if b["nome"] in d or "failed" in d][:6]
+            det = detalhes_por_bloco.get((b["nome"], b["sub"]), [])[:6]
             out.append({**base, "titulo": f"Teste da suíte falha: {b['nome']} → {b['sub']}", "tipo": "erro",
                         "severidade": "alta", "item_catalogo": "saude/suite-existente", "principio": "P6",
                         "esperado": "o bloco passa", "obtido": f"{b['falhas']} verificação(ões) falharam. " + " ".join(det),
@@ -85,6 +109,21 @@ def resultados_suite_por_item(itens: list[dict], blocos: list[dict]) -> dict[str
         else:
             out[it["id"]] = ("passou", None)
     return out
+
+
+def separar_validos(brutos: list[tuple[str, dict]]) -> tuple[list[dict], list[str]]:
+    """Portão de validação da consolidação: separa achados brutos (identificados por
+    'arquivo[i]', vindos do automático ou de subagentes) válidos dos inválidos, e formata
+    uma mensagem por inválido para `erros_agente.json`."""
+    validos: list[dict] = []
+    mensagens: list[str] = []
+    for origem, a in brutos:
+        erros = achados.validar(a)
+        if erros:
+            mensagens.append(f"achado inválido em {origem}: {erros}")
+        else:
+            validos.append(a)
+    return validos, mensagens
 
 
 # ---------- ações ----------
@@ -252,7 +291,7 @@ def cmd_achado(args: argparse.Namespace) -> int:
 def _consolidar(args) -> int:
     e = _sprint_atual()
     e.iniciar("consolidar")
-    brutos: list[dict] = []
+    brutos_com_origem: list[tuple[str, dict]] = []
     for p in sorted((e.pasta / "achados-brutos").glob("*.json")):
         obj = json.loads(p.read_text(encoding="utf-8"))
         vered = e.pasta / "vereditos" / p.name
@@ -260,7 +299,12 @@ def _consolidar(args) -> int:
         for i, a in enumerate(obj if isinstance(obj, list) else [obj]):
             if vlista is not None:
                 a["veredito"] = vlista[i] if isinstance(vlista, list) else vlista
-            brutos.append(a)
+            brutos_com_origem.append((f"{p.name}[{i}]", a))
+    brutos, invalidos = separar_validos(brutos_com_origem)
+    if invalidos:
+        erros_agente_p = e.pasta / "erros_agente.json"
+        existentes = json.loads(erros_agente_p.read_text(encoding="utf-8")) if erros_agente_p.exists() else []
+        sandbox.escrever_json(erros_agente_p, existentes + invalidos)
     rever_p = e.pasta / "reverificacoes.json"
     rever = json.loads(rever_p.read_text(encoding="utf-8")) if rever_p.exists() else {}
     for a in brutos:
@@ -275,16 +319,20 @@ def _consolidar(args) -> int:
     sandbox.escrever_json(e.pasta / "achados.json", lista)
     sandbox.escrever_json(e.pasta / "derrubados.json", derrubados)
     achados.salvar_historico(config.HISTORICO, hist)
+    resultados = catalogo.carregar_resultados(e.pasta)
     for a in lista:
         if a["estado"] in ("novo", "aberto", "regressao") and a["confianca"] == "confirmado" \
                 and a["tipo"] not in ("melhoria", "lacuna"):
             for x in a["alvos"]:
-                atual = catalogo.carregar_resultados(e.pasta).get((a["item_catalogo"], x["alvo"]), {})
+                atual = resultados.get((a["item_catalogo"], x["alvo"]), {})
                 ids = sorted(set(atual.get("achados", [])) | {a["id"]})
                 catalogo.registrar_resultado(e.pasta, a["item_catalogo"], x["alvo"], "falhou",
                                              atual.get("motivo"), ids, "consolidacao")
-    e.concluir("consolidar", {"achados": len(lista), "derrubados": len(derrubados)})
-    return _saida({"achados": len(lista), "derrubados": len(derrubados)})
+                resultados[(a["item_catalogo"], x["alvo"])] = {"item": a["item_catalogo"], "alvo": x["alvo"],
+                                                               "resultado": "falhou", "motivo": atual.get("motivo"),
+                                                               "achados": ids, "fonte": "consolidacao"}
+    e.concluir("consolidar", {"achados": len(lista), "derrubados": len(derrubados), "achados_invalidos": len(invalidos)})
+    return _saida({"achados": len(lista), "derrubados": len(derrubados), "achados_invalidos": len(invalidos)})
 
 
 def _encerrar(args) -> int:
