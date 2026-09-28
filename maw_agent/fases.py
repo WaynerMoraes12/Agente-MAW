@@ -111,6 +111,42 @@ def resultados_suite_por_item(itens: list[dict], blocos: list[dict]) -> dict[str
     return out
 
 
+_ORDEM_REVERIFICACAO = {"corrigido": 0, "nao_verificavel": 1, "persiste": 2}
+
+
+def juntar_reverificacoes(pasta: Path) -> tuple[dict[str, str], list[str]]:
+    """Junta `reverificacoes.json` (se existir) com cada `reverificacoes-<agente>.json` da pasta da
+    sprint (um arquivo por subagente). Em conflito para o mesmo id, vence o valor mais conservador
+    (persiste > nao_verificavel > corrigido — um achado só é 'corrigido' se ninguém disser que persiste);
+    cada conflito e cada valor fora dos três permitidos vira uma mensagem no segundo retorno."""
+    pasta = Path(pasta)
+    fontes: list[tuple[str, dict]] = []
+    base = pasta / "reverificacoes.json"
+    if base.exists():
+        fontes.append(("reverificacoes.json", json.loads(base.read_text(encoding="utf-8"))))
+    for arq in sorted(pasta.glob("reverificacoes-*.json")):
+        fontes.append((arq.stem[len("reverificacoes-"):], json.loads(arq.read_text(encoding="utf-8"))))
+    resultado: dict[str, str] = {}
+    de_onde: dict[str, str] = {}
+    mensagens: list[str] = []
+    for nome, dados in fontes:
+        for id_, valor in dados.items():
+            if valor not in _ORDEM_REVERIFICACAO:
+                mensagens.append(f"{id_}: valor inválido em {nome}: '{valor}' — ignorado")
+                continue
+            if id_ not in resultado:
+                resultado[id_] = valor
+                de_onde[id_] = nome
+            elif valor != resultado[id_]:
+                if _ORDEM_REVERIFICACAO[valor] > _ORDEM_REVERIFICACAO[resultado[id_]]:
+                    mensagens.append(f"{id_}: {de_onde[id_]} diz {resultado[id_]}, {nome} diz {valor} — ficou {valor}")
+                    resultado[id_] = valor
+                    de_onde[id_] = nome
+                else:
+                    mensagens.append(f"{id_}: {de_onde[id_]} diz {resultado[id_]}, {nome} diz {valor} — ficou {resultado[id_]}")
+    return resultado, mensagens
+
+
 def separar_validos(brutos: list[tuple[str, dict]]) -> tuple[list[dict], list[str]]:
     """Portão de validação da consolidação: separa achados brutos (identificados por
     'arquivo[i]', vindos do automático ou de subagentes) válidos dos inválidos, e formata
@@ -288,6 +324,25 @@ def cmd_achado(args: argparse.Namespace) -> int:
     return _saida({"ok": True, "registrado": str(destino)})
 
 
+def _cfg_catalogo(p: argparse.ArgumentParser) -> None:
+    p.add_argument("acao", choices=["validar"])
+
+
+@registrar("catalogo", "valida o catálogo de funcionalidades", _cfg_catalogo)
+def cmd_catalogo(args: argparse.Namespace) -> int:
+    itens = catalogo.carregar(config.CATALOGO)
+    princ = catalogo.carregar(config.PRINCIPIOS) if config.PRINCIPIOS.exists() else []
+    erros = catalogo.validar(itens)
+    ids = {i["id"] for i in itens}
+    for p in princ:
+        if f"principio/{p['id']}" not in ids:
+            erros.append(f"princípio {p['id']} sem item principio/{p['id']} no catálogo")
+    for obrig in ("saude/build-release", "saude/build-debug", "saude/suite-existente", "saude/benchmark"):
+        if obrig not in ids:
+            erros.append(f"item obrigatório ausente: {obrig}")
+    return _saida({"itens": len(itens), "principios": len(princ), "erros": erros}, not erros)
+
+
 def _consolidar(args) -> int:
     e = _sprint_atual()
     e.iniciar("consolidar")
@@ -301,12 +356,13 @@ def _consolidar(args) -> int:
                 a["veredito"] = vlista[i] if isinstance(vlista, list) else vlista
             brutos_com_origem.append((f"{p.name}[{i}]", a))
     brutos, invalidos = separar_validos(brutos_com_origem)
-    if invalidos:
+    rever, conflitos_rever = juntar_reverificacoes(e.pasta)
+    sandbox.escrever_json(e.pasta / "reverificacoes.json", rever)
+    erros_agente_novos = invalidos + conflitos_rever
+    if erros_agente_novos:
         erros_agente_p = e.pasta / "erros_agente.json"
         existentes = json.loads(erros_agente_p.read_text(encoding="utf-8")) if erros_agente_p.exists() else []
-        sandbox.escrever_json(erros_agente_p, existentes + invalidos)
-    rever_p = e.pasta / "reverificacoes.json"
-    rever = json.loads(rever_p.read_text(encoding="utf-8")) if rever_p.exists() else {}
+        sandbox.escrever_json(erros_agente_p, existentes + erros_agente_novos)
     for a in brutos:
         v = (a.get("veredito") or {}).get("resultado")
         if v == "provavel":
