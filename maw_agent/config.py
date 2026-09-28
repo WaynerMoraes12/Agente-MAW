@@ -21,6 +21,8 @@ BACKUPS = LOCALAPPDATA / "AgenteMAW" / "backups"
 APPDATA_MAW = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "MAW"
 URL_MAW = "https://github.com/WaynerMoraes12/MAW.git"
 USUARIO = Path(os.environ.get("USERPROFILE", str(Path.home())))
+# a suíte pode gravar áudio aqui; as pastas MAW* dentro dela são listadas antes e depois
+MUSICA = USUARIO / "Music"
 
 
 def pastas_protegidas() -> list[Path]:

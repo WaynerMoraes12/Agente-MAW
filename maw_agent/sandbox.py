@@ -197,7 +197,12 @@ def restaurar_pasta(backup: Path) -> None:
         raise RestauracaoFalhou(f"{origem} não ficou idêntica ao backup {backup}")
 
 
-def restaurar_e_descartar(backup: Path) -> None:
-    """Restaura, confere o manifesto e só então apaga o backup (que pode conter segredos)."""
-    restaurar_pasta(backup)
+def descartar_backup(backup: Path) -> None:
+    """Apaga um backup (ele pode conter segredos), com as mesmas tentativas contra PermissionError."""
     _com_tentativas(lambda: remover(backup))
+
+
+def restaurar_e_descartar(backup: Path) -> None:
+    """Restaura, confere o manifesto e só então apaga o backup."""
+    restaurar_pasta(backup)
+    descartar_backup(backup)

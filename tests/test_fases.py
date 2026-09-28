@@ -29,6 +29,89 @@ def test_resultados_suite_por_item():
     assert r["g/c"][0] == "nao_testavel" and "não encontrado" in r["g/c"][1]
     assert "g/d" not in r
 
+
+BLOCOS = [{"nome": "Bloco A", "sub": "x", "ok": 3, "falhas": 0},
+          {"nome": "Bloco A", "sub": "y", "ok": 2, "falhas": 0},
+          {"nome": "Bloco B", "sub": "z", "ok": 1, "falhas": 1},
+          {"nome": "Bloco A em lote", "sub": "w", "ok": 1, "falhas": 1}]
+
+
+def _item(verificacao, cenarios, marco="M2"):
+    return {"id": "area/x", "verificacao": verificacao, "cenarios": cenarios, "marco": marco}
+
+
+def test_suite_casa_bloco_por_nome_exato():
+    # "suite:Bloco A" não pode casar "Bloco A em lote" (que falhou)
+    r = fases.resultados_suite_por_item([_item(["suite"], ["suite:Bloco A"])], BLOCOS)
+    assert r["area/x"] == ("passou", None)
+
+
+def test_suite_bloco_referenciado_falhou_e_falhou():
+    r = fases.resultados_suite_por_item([_item(["suite", "e2e"], ["suite:Bloco A", "suite:Bloco B"])], BLOCOS)
+    assert r["area/x"] == ("falhou", None)
+
+
+def test_suite_so_passa_quando_toda_verificacao_foi_coberta():
+    r = fases.resultados_suite_por_item([_item(["suite"], ["suite:Bloco A"]),
+                                         {**_item(["suite", "benchmark"], ["suite:Bloco A"]), "id": "area/y"}],
+                                        BLOCOS, cobertas=("suite", "benchmark"))
+    assert r["area/x"] == ("passou", None) and r["area/y"] == ("passou", None)
+
+
+def test_suite_passou_mas_falta_verificacao_vira_parcial():
+    r = fases.resultados_suite_por_item([_item(["e2e", "suite", "revisao"], ["suite:Bloco A"], "M3")], BLOCOS)
+    assert r["area/x"] == ("nao_testavel",
+                           "parcial: blocos da suíte passaram (Bloco A); e2e, revisao previstas para o marco M3")
+    # benchmark só conta quando rodou nesta sprint
+    r = fases.resultados_suite_por_item([_item(["suite", "benchmark"], ["suite:Bloco A"], "M1")], BLOCOS)
+    assert r["area/x"][0] == "nao_testavel" and "benchmark previstas para o marco M1" in r["area/x"][1]
+
+
+def test_suite_classe_ausente_e_nao_testavel_mesmo_com_outra_passando():
+    r = fases.resultados_suite_por_item([_item(["suite"], ["suite:Bloco A", "suite:Sumiu", "suite:Tambem"])], BLOCOS)
+    assert r["area/x"] == ("nao_testavel", "bloco da suíte não encontrado: Sumiu, Tambem")
+
+
+# ---------- C2: só o binário desta sprint ----------
+import os
+import time as _time
+
+
+def test_binario_valido(tmp_path):
+    exe = tmp_path / "App.exe"
+    inicio = "2026-09-28T10:00:00"
+    t_inicio = _time.mktime(_time.strptime(inicio, "%Y-%m-%dT%H:%M:%S"))
+    assert fases.binario_valido(None, exe, inicio)[0] is False
+    assert fases.binario_valido({"ok": False}, exe, inicio) == (False, "build falhou nesta sprint")
+    assert fases.binario_valido({"ok": True}, exe, inicio)[0] is False  # exe ausente
+    exe.write_bytes(b"MZ")
+    os.utime(exe, (t_inicio - 3600, t_inicio - 3600))  # binário de uma sprint anterior
+    ok, motivo = fases.binario_valido({"ok": True}, exe, inicio)
+    assert not ok and "anterior" in motivo
+    assert fases.binario_valido({"ok": True}, exe, None)[0] is False
+    os.utime(exe, (t_inicio, t_inicio))  # mesmo segundo do início: vale
+    assert fases.binario_valido({"ok": True}, exe, inicio) == (True, "")
+
+
+# ---------- menor: assinatura do erro de build ----------
+
+def test_assinatura_de_build_sem_worktree_e_sem_linha_coluna():
+    a = fases.achado_de_build({"nome": "main", "commit": "a" * 40},
+                              {"config": "Release", "log": "l.log",
+                               "erros": [r"C:\w\alvos\main\Source\c.cpp(7,2): error C2065: 'y': não declarado"]})
+    b = fases.achado_de_build({"nome": "feature-x", "commit": "b" * 40},
+                              {"config": "Release", "log": "l.log",
+                               "erros": [r"D:\outro dir\alvos\feature-x\Source\c.cpp(9,14): error C2065: 'y': não declarado"]})
+    assert a["assinatura"] == b["assinatura"] == "build:Release:C2065:c.cpp:'y': não declarado"
+    assert achados.impressao_digital(a) == achados.impressao_digital(b)
+
+
+def test_assinatura_de_erro_de_link_tira_o_caminho_da_mensagem():
+    assert fases.assinatura_erro_build(
+        r"LINK : fatal error LNK1104: não é possível abrir o arquivo 'C:\Agente X\work\alvos\main\x64\App.exe'") \
+        == "LNK1104:LINK:não é possível abrir o arquivo 'App.exe'"
+
+
 def test_achado_de_build_sem_erros_reconheciveis_ainda_e_valido():
     a = fases.achado_de_build(ALVO, {"config": "Release", "erros": [], "log": "l.log"})
     assert achados.validar(a) == []
@@ -184,3 +267,151 @@ def test_consolidar_junta_reverificacoes_grava_e_relata_conflito(tmp_path, monke
     assert any("MAW-0001" in m for m in erros)
     [a] = json.loads((e2.pasta / "achados.json").read_text(encoding="utf-8"))
     assert a["estado"] == "aberto"
+
+
+
+def test_juntar_reverificacoes_com_extras_e_sem_base(tmp_path):
+    (tmp_path / "reverificacoes.json").write_text(json.dumps({"MAW-0001": "persiste"}), encoding="utf-8")
+    (tmp_path / "reverificacoes-a.json").write_text(json.dumps({"MAW-0002": "corrigido"}), encoding="utf-8")
+    rever, conflitos = fases.juntar_reverificacoes(tmp_path, incluir_base=False,
+                                                   extras=[("automatico", {"MAW-0002": "nao_verificavel"})])
+    assert rever == {"MAW-0002": "nao_verificavel"}
+    assert conflitos == ["MAW-0002: automatico diz nao_verificavel, a diz corrigido — ficou nao_verificavel"]
+
+
+def test_juntar_reverificacoes_arquivo_ilegivel_nao_quebra(tmp_path):
+    (tmp_path / "reverificacoes-a.json").write_text("{quebrado", encoding="utf-8")
+    (tmp_path / "reverificacoes-b.json").write_text(json.dumps(["lista"]), encoding="utf-8")
+    rever, msgs = fases.juntar_reverificacoes(tmp_path)
+    assert rever == {} and len(msgs) == 2 and all("ilegíveis" in m for m in msgs)
+
+
+# ---------- I5: reverificação dos achados automáticos ----------
+
+def _hist(*regs):
+    return {"proximo": 10, "itens": {f"imp{i}": r for i, r in enumerate(regs)}}
+
+
+def _reg(id_, fonte, assinatura, alvos_=("main",), estado_="aberto", item="saude/suite-existente"):
+    return {"id": id_, "estado": estado_, "historico": ["01"],
+            "ultimo": {"fonte": fonte, "assinatura": assinatura, "item_catalogo": item,
+                       "alvos": [{"alvo": a, "commit": "c"} for a in alvos_]}}
+
+
+ALVOS_SPRINT = [{"nome": "main", "commit": "a" * 40, "compartilha_com": None},
+                {"nome": "docs-z", "commit": "d" * 40, "compartilha_com": "main"}]
+
+
+def _gravar(pasta, rel, obj):
+    (pasta / rel).parent.mkdir(parents=True, exist_ok=True)
+    (pasta / rel).write_text(json.dumps(obj), encoding="utf-8")
+
+
+def test_reverificacao_automatica_de_build(tmp_path):
+    h = _hist(_reg("MAW-0001", "build", "build:Release:C2065:c.cpp:x", item="saude/build-release"),
+              _reg("MAW-0002", "build", "build:Debug:C2065:c.cpp:x", item="saude/build-debug"),
+              _reg("MAW-0003", "build", "build:Release:C1:x.cpp:y", alvos_=("sumiu",), item="saude/build-release"))
+    _gravar(tmp_path, "builds/main-Release.json", {"ok": True})
+    _gravar(tmp_path, "builds/main-Debug.json", {"ok": False, "erros": ["outro erro"]})
+    r = fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path)
+    # Release compilou: o critério de aceite passa. Debug falhou por outro motivo: não dá para dizer.
+    assert r == {"MAW-0001": "corrigido", "MAW-0002": "nao_verificavel"}  # MAW-0003: alvo não existe nesta sprint
+
+
+def test_reverificacao_automatica_de_build_que_nao_rodou(tmp_path):
+    h = _hist(_reg("MAW-0001", "build", "build:Release:C2065:c.cpp:x", item="saude/build-release"))
+    assert fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path) == {"MAW-0001": "nao_verificavel"}
+
+
+def test_reverificacao_automatica_da_suite(tmp_path):
+    h = _hist(_reg("MAW-0001", "suite", "suite:Bloco A|x"),
+              _reg("MAW-0002", "suite", "suite:Bloco B|y"),
+              _reg("MAW-0003", "suite", "suite:Bloco Sumido|z"),
+              _reg("MAW-0004", "suite", "jassert:JUCE Assertion failure in a.cpp:10"),
+              _reg("MAW-0005", "suite", "suite-incoerente:totais ausentes"),
+              _reg("MAW-0006", "suite", "suite:Bloco A|x", estado_="corrigido"))
+    _gravar(tmp_path, "suites/main.json", {"blocos": [{"nome": "Bloco A", "sub": "x", "ok": 1, "falhas": 0},
+                                                      {"nome": "Bloco B", "sub": "y", "ok": 0, "falhas": 1}],
+                                           "incoerencias": [], "assercoes": [], "captura_erro": None})
+    r = fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path)
+    assert r == {"MAW-0001": "corrigido", "MAW-0002": "persiste", "MAW-0003": "nao_verificavel",
+                 "MAW-0004": "corrigido", "MAW-0005": "corrigido"}
+
+
+def test_reverificacao_automatica_jassert_sem_captura_nao_e_corrigido(tmp_path):
+    h = _hist(_reg("MAW-0004", "suite", "jassert:JUCE Assertion failure in a.cpp:10"))
+    _gravar(tmp_path, "suites/main.json", {"blocos": [], "incoerencias": [], "assercoes": [],
+                                           "captura_erro": "outro ouvinte ativo"})
+    assert fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path) == {"MAW-0004": "nao_verificavel"}
+
+
+def test_reverificacao_automatica_jassert_com_outra_assercao_nao_e_corrigido(tmp_path):
+    h = _hist(_reg("MAW-0004", "suite", "jassert:JUCE Assertion failure in a.cpp:10"),
+              _reg("MAW-0005", "suite", "jassert:JUCE Assertion failure in b.cpp:3"))
+    _gravar(tmp_path, "suites/main.json", {"blocos": [], "incoerencias": [], "captura_erro": None,
+                                           "assercoes": ["JUCE Assertion failure in b.cpp:4"]})
+    r = fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path)
+    assert r == {"MAW-0004": "nao_verificavel", "MAW-0005": "persiste"}
+
+
+def test_reverificacao_automatica_alvo_que_compartilha_usa_a_origem(tmp_path):
+    h = _hist(_reg("MAW-0001", "suite", "suite:Bloco A|x", alvos_=("docs-z",)),
+              _reg("MAW-0002", "suite", "suite:Bloco A|x", alvos_=("main", "docs-z", "sumiu")))
+    _gravar(tmp_path, "suites/main.json", {"blocos": [{"nome": "Bloco A", "sub": "x", "ok": 1, "falhas": 0}],
+                                           "incoerencias": [], "assercoes": [], "captura_erro": None})
+    r = fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path)
+    assert r == {"MAW-0001": "corrigido", "MAW-0002": "corrigido"}
+
+
+def test_reverificacao_automatica_combina_alvos_pelo_mais_conservador(tmp_path):
+    alvos_ = [{"nome": "main", "commit": "a", "compartilha_com": None},
+              {"nome": "feature-x", "commit": "b", "compartilha_com": None}]
+    h = _hist(_reg("MAW-0001", "suite", "suite:Bloco A|x", alvos_=("main", "feature-x")))
+    _gravar(tmp_path, "suites/main.json", {"blocos": [{"nome": "Bloco A", "sub": "x", "ok": 1, "falhas": 0}],
+                                           "incoerencias": [], "assercoes": [], "captura_erro": None})
+    assert fases.reverificacoes_automaticas(h, alvos_, tmp_path) == {"MAW-0001": "nao_verificavel"}
+
+
+# ---------- I6: veredito ausente ou ilegível ----------
+
+def test_ler_brutos_vereditos(tmp_path):
+    bruto = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
+    outro = dict(bruto, assinatura="outra")
+    _gravar(tmp_path, "achados-brutos/a.json", bruto)              # sem veredito
+    _gravar(tmp_path, "achados-brutos/b.json", [bruto, outro])     # lista de vereditos curta
+    _gravar(tmp_path, "vereditos/b.json", [{"resultado": "confirmado", "justificativa": "ok"}])
+    _gravar(tmp_path, "achados-brutos/c.json", bruto)              # veredito sem 'resultado'
+    _gravar(tmp_path, "vereditos/c.json", {"justificativa": "esqueci"})
+    _gravar(tmp_path, "achados-brutos/d.json", bruto)              # veredito com JSON inválido
+    (tmp_path / "vereditos" / "d.json").write_text("{nao e json", encoding="utf-8")
+    _gravar(tmp_path, "achados-brutos/e.json", bruto)              # veredito legível
+    _gravar(tmp_path, "vereditos/e.json", {"resultado": "provavel", "justificativa": "x"})
+    (tmp_path / "achados-brutos" / "f.json").write_text("[quebrado", encoding="utf-8")  # bruto ilegível
+    entradas, sem_verificacao, msgs = fases.ler_brutos(tmp_path)
+    por_origem = {o: a for o, a in entradas}
+    assert set(por_origem) == {"a.json[0]", "b.json[0]", "b.json[1]", "c.json[0]", "d.json[0]", "e.json[0]"}
+    sem = {o for o, a in entradas if id(a) in sem_verificacao}
+    assert sem == {"a.json[0]", "b.json[1]", "c.json[0]", "d.json[0]"}
+    assert all(por_origem[o]["confianca"] == "provavel" and por_origem[o]["veredito"] is None for o in sem)
+    assert por_origem["b.json[0]"]["veredito"]["resultado"] == "confirmado"
+    assert por_origem["e.json[0]"]["veredito"]["resultado"] == "provavel"
+    assert any("b.json[1]" in m for m in msgs) and any("c.json[0]" in m for m in msgs)
+    assert any("d.json" in m for m in msgs) and any("f.json" in m for m in msgs)
+    assert not any("a.json" in m for m in msgs)  # só ausente: vai para o contador, não para os erros
+
+
+# ---------- I9: referências do achado ----------
+
+def test_conferir_referencias():
+    a = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
+    ids = {"saude/build-release"}
+    alvos_ = {"main": "a" * 40}
+    assert fases.conferir_referencias([a], ids, alvos_) == []
+    assert fases.conferir_referencias([a], None, alvos_) == []  # sem catálogo, não confere o item
+    erros = fases.conferir_referencias([dict(a, item_catalogo="nao/existe")], ids, alvos_)
+    assert len(erros) == 1 and "nao/existe" in erros[0] and "catálogo" in erros[0]
+    erros = fases.conferir_referencias([dict(a, alvos=[{"alvo": "feature/x", "commit": "a" * 40}])], ids, alvos_)
+    assert len(erros) == 1 and "feature/x" in erros[0] and "alvos.json" in erros[0]
+    erros = fases.conferir_referencias([dict(a, alvos=[{"alvo": "main", "commit": "b" * 40}])], ids, alvos_)
+    assert len(erros) == 1 and "commit" in erros[0]
+    assert "alvos.json" in fases.conferir_referencias([a], ids, None)[0]
