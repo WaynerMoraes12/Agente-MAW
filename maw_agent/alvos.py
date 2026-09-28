@@ -1,6 +1,7 @@
 """Espelho próprio da MAW, descoberta de alvos, worktrees e prova de intocada."""
 from __future__ import annotations
 import hashlib
+import os
 import re
 import subprocess
 from dataclasses import asdict, dataclass
@@ -26,10 +27,26 @@ class Alvo:
         return asdict(self)
 
 
+# git nunca pede credencial na madrugada: sem prompt no terminal nem janela do gerenciador de credenciais
+_ENV_GIT = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}
+_LENTOS = ("fetch", "clone")
+
+
+def _rodar_git(cmd: list[str], cwd: Path | None, timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Roda git sem prompt e com limite de tempo (600 s para fetch/clone, 60 s para o resto)."""
+    sub = next((c for c in cmd[1:] if not c.startswith("-")), "")
+    timeout = timeout or (600 if sub in _LENTOS else 60)
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env={**os.environ, **_ENV_GIT}, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{' '.join(cmd[:4])} não respondeu em {timeout} s (em {cwd}); "
+                           "rede ou credencial travada?") from None
+
+
 def git(args: list[str], cwd: Path, leitura: bool = False) -> str:
     base = ["git", "--no-optional-locks"] if leitura else ["git"]
-    p = subprocess.run(base + args, cwd=cwd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    p = _rodar_git(base + args, cwd)
     if p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} falhou em {cwd}: {p.stderr.strip()}")
     return p.stdout.strip()
@@ -44,8 +61,7 @@ def garantir_espelho(espelho: Path = config.ESPELHO, url: str = config.URL_MAW,
     espelho = Path(espelho)
     if not (espelho / ".git").exists():
         sandbox.criar_pasta(espelho.parent)
-        p = subprocess.run(["git", "clone", "-q", "--no-checkout", url, str(espelho)],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        p = _rodar_git(["git", "clone", "-q", "--no-checkout", url, str(espelho)], None)
         if p.returncode != 0:
             raise RuntimeError(f"git clone falhou para {espelho}: {p.stderr.strip()}")
     git(["remote", "set-url", "--push", "origin", "nao-faca-push"], espelho)
@@ -72,9 +88,7 @@ def importar_clones_locais(espelho: Path, pastas: list[Path]) -> list[dict]:
 
 
 def _e_ancestral(espelho: Path, a: str, b: str) -> bool:
-    p = subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=espelho,
-                       capture_output=True)
-    return p.returncode == 0
+    return _rodar_git(["git", "merge-base", "--is-ancestor", a, b], espelho).returncode == 0
 
 
 def _assinatura(espelho: Path, commit: str) -> str:
@@ -109,7 +123,7 @@ def descobrir_alvos(espelho: Path, locais: list[dict]) -> tuple[list[Alvo], list
             continue
         existentes = candidatos.setdefault(loc["branch"], [])
         novo = {"branch": loc["branch"], "ref": loc["ref"], "commit": loc["commit"],
-                "origem": f"local:{nome_pasta}"}
+                "origem": f"local:{nome_pasta}", "pasta": nome_pasta}
         substituido = False
         for i, ex in enumerate(existentes):
             if ex["commit"] == novo["commit"] or _e_ancestral(espelho, novo["commit"], ex["commit"]):
@@ -126,7 +140,9 @@ def descobrir_alvos(espelho: Path, locais: list[dict]) -> tuple[list[Alvo], list
     for branch in ["main"] + sorted(b for b in candidatos if b != "main"):
         grupo = candidatos[branch]
         for c in grupo:
-            nome = slug(branch) if len(grupo) == 1 or c["origem"] == "github" else f"{slug(branch)}-local"
+            # dois clones locais da mesma branch não podem colidir: o nome leva a pasta
+            nome = (slug(branch) if len(grupo) == 1 or c["origem"] == "github"
+                    else f"{slug(branch)}-local-{slug(c['pasta'])}")
             assin = _assinatura(espelho, c["commit"])
             lista.append(Alvo(nome, branch, c["ref"], c["commit"], c["origem"], assin, vistos.get(assin)))
             vistos.setdefault(assin, nome)
@@ -138,6 +154,7 @@ def criar_worktree(espelho: Path, alvo: Alvo, raiz: Path = config.ALVOS_DIR) -> 
     if (destino / ".git").exists():
         if git(["rev-parse", "HEAD"], destino) == alvo.commit:
             return destino
+        sandbox.garantir_escrita(destino)  # checkout e clean escrevem: só fora das pastas da MAW
         git(["checkout", "-q", "--detach", "--force", alvo.commit], destino)
         git(["clean", "-fdq"], destino)  # sem -x: mantém o que o .gitignore ignora (ex.: build/)
         return destino
@@ -147,16 +164,30 @@ def criar_worktree(espelho: Path, alvo: Alvo, raiz: Path = config.ALVOS_DIR) -> 
     return destino
 
 
+def _lista_de_arquivos(pasta: Path) -> list[list]:
+    """(caminho relativo, tamanho, mtime em ns) de cada arquivo: a prova de uma pasta sem git."""
+    out = []
+    for arq in sorted(pasta.rglob("*")):
+        if arq.is_file():
+            st = arq.stat()
+            out.append([arq.relative_to(pasta).as_posix(), st.st_size, st.st_mtime_ns])
+    return out
+
+
 def prova_intocada(pastas: list[Path]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for pasta in pastas:
         pasta = Path(pasta)
+        if not pasta.is_dir():
+            continue
         if not (pasta / ".git").exists():
+            out[pasta.name] = {"tipo": "arquivos", "arquivos": _lista_de_arquivos(pasta)}
             continue
         status = git(["status", "--porcelain=v1", "--untracked-files=all"], pasta, leitura=True)
-        diff = subprocess.run(["git", "--no-optional-locks", "diff", "HEAD", "--binary"],
-                              cwd=pasta, capture_output=True).stdout
+        diff = subprocess.run(["git", "--no-optional-locks", "diff", "HEAD", "--binary"], cwd=pasta,
+                              capture_output=True, env={**os.environ, **_ENV_GIT}, timeout=60).stdout
         out[pasta.name] = {
+            "tipo": "git",
             "head": git(["rev-parse", "HEAD"], pasta, leitura=True),
             "branch": git(["branch", "--show-current"], pasta, leitura=True),
             "hash_status": hashlib.sha256(status.encode()).hexdigest(),
@@ -165,11 +196,31 @@ def prova_intocada(pastas: list[Path]) -> dict[str, dict]:
     return out
 
 
+def _diferenca_de_arquivos(a: list[list], d: list[list]) -> str:
+    antes = {x[0]: tuple(x[1:]) for x in a}
+    depois = {x[0]: tuple(x[1:]) for x in d}
+    novos = sorted(set(depois) - set(antes))
+    removidos = sorted(set(antes) - set(depois))
+    alterados = sorted(k for k in set(antes) & set(depois) if antes[k] != depois[k])
+    partes = []
+    for rotulo, lista in (("novos", novos), ("alterados", alterados), ("removidos", removidos)):
+        if lista:
+            exemplos = ", ".join(lista[:5]) + (" …" if len(lista) > 5 else "")
+            partes.append(f"{len(lista)} {rotulo}: {exemplos}")
+    return "; ".join(partes)
+
+
 def comparar_provas(antes: dict, depois: dict) -> list[str]:
+    if not antes and not depois:
+        return ["nenhuma pasta da MAW encontrada para provar"]
     difs = []
     for nome in sorted(set(antes) | set(depois)):
         a, d = antes.get(nome), depois.get(nome)
-        if a != d:
+        if a == d:
+            continue
+        if a and d and a.get("tipo") == d.get("tipo") == "arquivos":
+            difs.append(f"{nome}: arquivos mudaram ({_diferenca_de_arquivos(a['arquivos'], d['arquivos'])})")
+        else:
             campos = sorted(k for k in set((a or {})) | set((d or {})) if (a or {}).get(k) != (d or {}).get(k))
             difs.append(f"{nome}: mudou ({', '.join(campos)})")
     return difs
