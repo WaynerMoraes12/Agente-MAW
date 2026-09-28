@@ -4,13 +4,20 @@ O exe é /SUBSYSTEM:Windows: subprocess.run espera o processo, e o resultado só
 é "passou" quando o código de saída, a linha RESULTADO e os totais concordam.
 """
 from __future__ import annotations
+import ctypes
+import os
 import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import psutil
+
 from . import redacao
+
+# herdados pelo processo filho: nenhum diálogo "o programa parou" ou "insira um disco" trava a madrugada
+_SEM_DIALOGOS = 0x0001 | 0x0002  # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
 
 _RX_BLOCO = re.compile(r"^\[(ok|FALHOU)\]\s+(.+?)\s{2,}->\s{2,}(.+?)\s+\((\d+) ok, (\d+) falha\(s\)\)\s*$")
 _RX_NUM = {
@@ -138,25 +145,46 @@ def interpretar_benchmark(texto: str) -> tuple[list[LinhaBenchmark], list[str]]:
     return linhas, cab
 
 
-def executar(exe: Path, argumento: str, cwd: Path, timeout: int) -> tuple[int | None, str, float]:
+def maw_aberta() -> bool:
+    """Há um MAW_APP.exe rodando (a MAW do usuário)?"""
+    return any((p.info.get("name") or "").lower() == "maw_app.exe" for p in psutil.process_iter(["name"]))
+
+
+def ambiente_com_ffmpeg(base: dict[str, str], ffmpeg_bin: Path) -> dict[str, str]:
+    """Cópia de `base` com a pasta do ffmpeg portátil na frente do PATH, quando ela existe."""
+    env = dict(base)
+    if Path(ffmpeg_bin).is_dir():
+        env["PATH"] = os.pathsep.join([str(ffmpeg_bin), env.get("PATH", "")])
+    return env
+
+
+def executar(exe: Path, argumento: str, cwd: Path, timeout: int,
+             env: dict[str, str] | None = None) -> tuple[int | None, str, float]:
+    k32 = ctypes.windll.kernel32
+    modo_anterior = k32.GetErrorMode()
+    k32.SetErrorMode(modo_anterior | _SEM_DIALOGOS)
     inicio = time.monotonic()
     try:
         p = subprocess.run([str(exe), argumento], cwd=cwd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
         codigo, saida = p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
         saida_parcial = e.stdout or ""
+        if isinstance(saida_parcial, bytes):
+            saida_parcial = saida_parcial.decode("utf-8", errors="replace")
         codigo, saida = None, f"{saida_parcial}\nTIMEOUT depois de {timeout}s"
+    finally:
+        k32.SetErrorMode(modo_anterior)
     return codigo, redacao.redigir(saida), round(time.monotonic() - inicio, 1)
 
 
-def rodar_suite(exe: Path, cwd: Path, timeout: int = 1800) -> ResultadoSuite:
-    codigo, saida, seg = executar(exe, "--run-tests", cwd, timeout)
+def rodar_suite(exe: Path, cwd: Path, timeout: int = 1800, env: dict[str, str] | None = None) -> ResultadoSuite:
+    codigo, saida, seg = executar(exe, "--run-tests", cwd, timeout, env)
     return interpretar_suite(saida, codigo, seg)
 
 
-def rodar_benchmark(exe: Path, cwd: Path, timeout: int = 1800) -> dict:
-    codigo, saida, seg = executar(exe, "--benchmark", cwd, timeout)
+def rodar_benchmark(exe: Path, cwd: Path, timeout: int = 1800, env: dict[str, str] | None = None) -> dict:
+    codigo, saida, seg = executar(exe, "--benchmark", cwd, timeout, env)
     linhas, cab = interpretar_benchmark(saida)
     return {"exit_code": codigo, "segundos": seg, "linhas": [asdict(l) for l in linhas],
             "cabecalho": cab, "bruto": saida}

@@ -1,3 +1,4 @@
+from pathlib import Path
 from maw_agent import suite
 
 OK = ("  (aviso qualquer)\r\n\r\nNOME - suite de testes automatizados (juce::UnitTest)\r\n\r\n"
@@ -60,3 +61,53 @@ def test_timeout_sem_exit_code():
     r = suite.interpretar_suite(OK, None, 1.0)
     assert not r.passou
     assert r.exit_code is None
+
+
+# ---------- executar: ambiente, diálogos do Windows e MAW aberta ----------
+import ctypes
+import os
+import sys
+
+
+def test_executar_passa_o_ambiente(tmp_path):
+    env = {**os.environ, "VAR_DO_TESTE": "valor-do-teste"}
+    codigo, saida, _ = suite.executar(Path(sys.executable),
+                                      "-cimport os; print(os.environ.get('VAR_DO_TESTE'))", tmp_path, 60, env=env)
+    assert codigo == 0 and "valor-do-teste" in saida
+
+
+def test_executar_desliga_dialogos_de_erro_no_filho_e_restaura(tmp_path, monkeypatch):
+    k32 = ctypes.windll.kernel32
+    original = k32.GetErrorMode()
+    visto = {}
+
+    def run_falso(args, **kw):
+        visto["modo"] = k32.GetErrorMode()
+        return suite.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(suite.subprocess, "run", run_falso)
+    k32.SetErrorMode(0)
+    try:
+        suite.executar(Path("x.exe"), "--run-tests", tmp_path, 10)
+        assert visto["modo"] & 0x3 == 0x3  # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+        assert k32.GetErrorMode() == 0
+    finally:
+        k32.SetErrorMode(original)
+
+
+def test_maw_aberta(monkeypatch):
+    class P:
+        def __init__(self, nome): self.info = {"name": nome}
+    monkeypatch.setattr(suite.psutil, "process_iter", lambda attrs: [P("explorer.exe"), P(None)])
+    assert suite.maw_aberta() is False
+    monkeypatch.setattr(suite.psutil, "process_iter", lambda attrs: [P("MAW_APP.exe")])
+    assert suite.maw_aberta() is True
+
+
+def test_ambiente_com_ffmpeg_no_path(tmp_path):
+    base = {"PATH": r"C:\Windows", "OUTRA": "1"}
+    assert suite.ambiente_com_ffmpeg(base, tmp_path / "nao-existe") == base
+    bin_ = tmp_path / "ffmpeg" / "bin"; bin_.mkdir(parents=True)
+    env = suite.ambiente_com_ffmpeg(base, bin_)
+    assert env["PATH"].split(os.pathsep)[0] == str(bin_) and env["OUTRA"] == "1"
+    assert base["PATH"] == r"C:\Windows"  # não altera o dicionário recebido
