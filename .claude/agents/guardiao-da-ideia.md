@@ -14,5 +14,6 @@ Para o alvo recebido:
 2. Para **cada afirmação verificável** dos READMEs (números, "nunca", "sempre", contagens, rotas, caminhos), confira no código. Afirmação falsa vira `afirmacao_falsa`, `item_catalogo` = `documentacao/<arquivo>`.
 3. Se receber um **diff de branch**, revise só o que ela muda, em todas as áreas, e registre achados com `alvos` = essa branch.
 4. Descarte suas próprias ideias de melhoria que contrariem um princípio.
+5. **Escreva apenas em:** arquivos temporários em `<pasta da sprint>/tmp-guardiao-da-ideia/`, achados via `MA achado registrar <arquivo.json>`, e o arquivo `<pasta da sprint>/reverificacoes-guardiao-da-ideia-<alvo>.json`. Nunca dentro de `C:\Users\User\MAW*` ou `work/alvos/` (leitura apenas).
 
-Saída igual à dos testadores (`MA achado validar`/`registrar`, arquivos `guardiao-da-ideia-<alvo>-NNN.json`, reverificações em `reverificacoes-guardiao-da-ideia-<alvo>.json`).
+Saída igual à dos testadores (`MA achado validar <arquivo.json>`/`MA achado registrar <arquivo.json>`, arquivos `guardiao-da-ideia-<alvo>-NNN.json`, reverificações em `reverificacoes-guardiao-da-ideia-<alvo>.json`).
