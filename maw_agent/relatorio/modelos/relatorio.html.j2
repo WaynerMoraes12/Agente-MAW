@@ -1,0 +1,140 @@
+{# maw_agent/relatorio/modelos/relatorio.html.j2 #}
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>MAW — {{ sprint }}</title>
+<style>{{ css }}</style></head>
+<body>
+
+<section class="capa">
+  {% if logo_data_uri %}<img class="logo" src="{{ logo_data_uri }}" alt="MAW">{% else %}<div class="logo-texto">MAW</div>{% endif %}
+  <h1>Relatório de testes</h1>
+  <p class="sub">{{ sprint }} · {{ data }} · duração {{ duracao }}</p>
+  <table class="alvos-capa">
+    <tr><th>Alvo</th><th>Branch</th><th>Commit</th><th>Origem</th><th>Situação</th></tr>
+    {% for a in alvos %}<tr><td>{{ a.nome }}</td><td>{{ a.branch }}</td><td class="mono">{{ a.commit[:10] }}</td>
+      <td>{{ a.origem }}</td><td><span class="sem {{ a.semaforo }}">{{ a.semaforo_rotulo }}</span></td></tr>{% endfor %}
+  </table>
+  <p class="veredito">{{ veredito }}</p>
+  <p class="intocada {{ 'ok' if intocada.verificado else 'falha' }}">
+    {% if intocada.verificado %}MAW intocada: verificado{% else %}MAW intocada: NÃO verificado — {{ intocada.diferencas | join('; ') }}{% endif %}
+  </p>
+</section>
+
+<section>
+  <h2>1. Resumo executivo</h2>
+  {% if resumo %}<div class="texto">{{ resumo }}</div>{% endif %}
+  <div class="cartoes">
+    {% for sev in ['critica','alta','media','baixa'] %}
+      <div class="cartao {{ sev }}"><b>{{ contagens.por_severidade.get(sev, 0) }}</b><span>{{ sev }}</span></div>
+    {% endfor %}
+    <div class="cartao"><b>{{ contagens.por_estado.get('novo', 0) }}</b><span>novos</span></div>
+    <div class="cartao"><b>{{ contagens.por_estado.get('corrigido', 0) }}</b><span>corrigidos</span></div>
+    <div class="cartao"><b>{{ contagens.por_estado.get('regressao', 0) }}</b><span>regressões</span></div>
+  </div>
+  <h3>Os mais graves</h3>
+  {% if top5 %}<ol>{% for a in top5 %}<li><b>{{ a.id }}</b> [{{ a.severidade }}] {{ a.titulo }} — {{ a.alvos | map(attribute='alvo') | join(', ') }}</li>{% endfor %}</ol>
+  {% else %}<p>Nenhum achado aberto.</p>{% endif %}
+  <h3>Cobertura</h3>
+  <p>{{ cobertura.passou }} passaram · {{ cobertura.falhou }} falharam · {{ cobertura.nao_testavel }} não testáveis · {{ cobertura.na }} não se aplicam
+     (de {{ matriz.linhas | length }} itens × {{ matriz.alvos | length }} alvos).</p>
+</section>
+
+<section>
+  <h2>2. Comparação com a sprint anterior</h2>
+  {% if anterior %}<p>Comparado com {{ anterior }}.</p>{% else %}<p>Primeira sprint: não há comparação.</p>{% endif %}
+  <p><b>Corrigidos:</b> {% for a in corrigidos %}{{ a.id }} {% else %}nenhum{% endfor %} ·
+     <b>Regressões:</b> {% for a in regressoes %}{{ a.id }} {% else %}nenhuma{% endfor %}</p>
+</section>
+
+<section>
+  <h2>3. Por alvo</h2>
+  {% for a in alvos %}
+  <div class="alvo">
+    <h3>{{ a.nome }} <span class="sem {{ a.semaforo }}">{{ a.semaforo_rotulo }}</span></h3>
+    <p class="mono">{{ a.branch }} @ {{ a.commit[:10] }} ({{ a.origem }}){% if a.compartilha_com %} — mesma árvore de código de {{ a.compartilha_com }}: execução compartilhada{% endif %}</p>
+    {% if a.texto %}<p>{{ a.texto }}</p>{% endif %}
+    <p>Achados neste alvo: {{ a.achados_ids | join(', ') or 'nenhum' }}{% if a.introduzidos %} · introduzidos por esta branch: {{ a.introduzidos | join(', ') }}{% endif %}</p>
+  </div>
+  {% endfor %}
+</section>
+
+<section class="quebra">
+  <h2>4. Instruções para o agente de correção</h2>
+  <ol>
+    <li>Reproduza cada achado seguindo os passos antes de mudar qualquer código.</li>
+    <li>Respeite os princípios da MAW; uma correção que viola um princípio não é correção.</li>
+    <li>Nunca altere um teste para que ele passe.</li>
+    <li>Um achado por commit, citando o ID (ex.: <span class="mono">fix: … (MAW-0001)</span>).</li>
+    <li>O achado só está corrigido quando o critério de aceite passa.</li>
+    <li>Os dados exatos de todos os achados estão no arquivo <span class="mono">achados.json</span> anexado a este PDF.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>5. Achados</h2>
+  {% for a in achados %}
+  <article class="ficha {{ a.severidade }}">
+    <h3>{{ a.id }} · {{ a.titulo }}</h3>
+    <p class="meta">{{ a.tipo }} · {{ a.severidade }} · {{ a.confianca }} · {{ a.estado }}{% if a.principio %} · princípio {{ a.principio }}{% endif %} · item <span class="mono">{{ a.item_catalogo }}</span></p>
+    <p class="meta">Alvos: {% for x in a.alvos %}{{ x.alvo }}@{{ x.commit[:8] }} {% endfor %}{% if a.introduzido_por %}· introduzido por {{ a.introduzido_por }}{% endif %}</p>
+    <h4>Passos</h4><ol>{% for p in a.passos %}<li>{{ p }}</li>{% endfor %}</ol>
+    <div class="duas"><div><h4>Esperado</h4><p>{{ a.esperado }}</p></div><div><h4>Obtido</h4><p>{{ a.obtido }}</p></div></div>
+    {% if a.causa_provavel %}<h4>Causa provável (hipótese)</h4><p><span class="mono">{{ a.causa_provavel.arquivo_linha }}</span> — {{ a.causa_provavel.texto }}</p>{% endif %}
+    <h4>Sugestão</h4><p>{{ a.sugestao }}</p>
+    <h4>Critério de aceite</h4><p>{{ a.criterio_aceite }}</p>
+    {% for ev in a.evidencias if ev.embutir and ev.data_uri %}<figure><img src="{{ ev.data_uri }}"><figcaption>{{ ev.legenda }}</figcaption></figure>{% endfor %}
+  </article>
+  {% else %}<p>Nenhum achado.</p>{% endfor %}
+</section>
+
+<section>
+  <h2>6. Melhorias propostas</h2>
+  {% for a in melhorias %}
+  <article class="ficha melhoria"><h3>{{ a.id }} · {{ a.titulo }}</h3>
+    <p class="meta">prioridade {{ a.prioridade }}{% if a.principio %} · serve ao princípio {{ a.principio }}{% endif %}</p>
+    <p>{{ a.obtido }}</p><h4>Proposta</h4><p>{{ a.sugestao }}</p><h4>Critério de aceite</h4><p>{{ a.criterio_aceite }}</p></article>
+  {% else %}<p>Nenhuma melhoria proposta.</p>{% endfor %}
+</section>
+
+<section>
+  <h2>7. Aderência à ideia da MAW</h2>
+  {% if principios %}
+  <table class="grade"><tr><th>Princípio</th>{% for n in matriz.alvos %}<th>{{ n }}</th>{% endfor %}<th>Violações</th></tr>
+  {% for p in principios %}<tr><td>{{ p.id }} — {{ p.titulo }}</td>{% for c in p.celulas %}<td class="c {{ c.resultado }}">{{ c.resultado | simbolo }}</td>{% endfor %}<td>{{ p.violacoes | join(', ') }}</td></tr>{% endfor %}
+  </table>{% else %}<p>Princípios não carregados nesta execução.</p>{% endif %}
+</section>
+
+<section>
+  <h2>8. Saúde técnica</h2>
+  <table class="grade"><tr><th>Alvo</th><th>Build Release</th><th>Build Debug</th><th>Suíte</th><th>Benchmark (32 trilhas, carga máx.)</th></tr>
+  {% for a in alvos %}<tr><td>{{ a.nome }}</td>
+    <td>{% if a.build %}{{ 'ok' if a.build.ok else 'FALHOU' }} · {{ a.build.segundos }} s · {{ a.build.avisos | length }} avisos{% else %}não registrado{% endif %}</td>
+    <td>{% if a.build_debug %}{{ 'ok' if a.build_debug.ok else 'FALHOU' }} · {{ a.build_debug.segundos }} s{% else %}não registrado{% endif %}</td>
+    <td>{% if a.suite %}{{ a.suite.total_ok }} ok / {{ a.suite.total_falhas }} falhas em {{ a.suite.blocos | length }} blocos{% if a.suite.assercoes %} · {{ a.suite.assercoes | length }} jassert{% endif %}{% else %}não registrada{% endif %}</td>
+    <td>{% if a.benchmark and a.benchmark.linhas %}{{ a.benchmark.linhas[-1].carga_max }} %{% else %}não registrado{% endif %}</td></tr>{% endfor %}
+  </table>
+</section>
+
+<section class="paisagem">
+  <h2>9. Matriz de cobertura</h2>
+  <p class="legenda">✓ passou · ✗ falhou · – não testável (motivo nas limitações) · n/a não se aplica</p>
+  <table class="matriz"><thead><tr><th>Item</th>{% for n in matriz.alvos %}<th>{{ n }}</th>{% endfor %}</tr></thead>
+  <tbody>{% for l in matriz.linhas %}<tr><td><span class="mono">{{ l.item }}</span> {{ l.titulo }}</td>
+    {% for c in l.celulas %}<td class="c {{ c.resultado }}">{{ c.resultado | simbolo }}{% if c.achados %}<br><small>{{ c.achados | join(' ') }}</small>{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody></table>
+</section>
+
+<section>
+  <h2>10. Limitações desta sprint</h2>
+  <ul>{% for l in limitacoes %}<li>{{ l }}</li>{% else %}<li>Nenhuma.</li>{% endfor %}</ul>
+  <h3>Achados derrubados na verificação ({{ derrubados | length }})</h3>
+  <ul>{% for d in derrubados %}<li>{{ d.titulo }} — {{ d.justificativa }}</li>{% else %}<li>Nenhum.</li>{% endfor %}</ul>
+  <h3>Erros do próprio agente</h3>
+  <ul>{% for e in erros_agente %}<li>{{ e }}</li>{% else %}<li>Nenhum.</li>{% endfor %}</ul>
+</section>
+
+<section>
+  <h2>11. Ambiente e método</h2>
+  <table class="grade">{% for k, v in ambiente.items() %}<tr><td>{{ k }}</td><td>{{ v if v is string else (v | join(', ') if v is iterable else v) }}</td></tr>{% endfor %}</table>
+  <h3>Pré-voo</h3>
+  <ul>{% for v in preflight %}<li>{{ '✓' if v.ok else '✗' }} {{ v.nome }} — {{ v.detalhe }}</li>{% endfor %}</ul>
+</section>
+</body></html>

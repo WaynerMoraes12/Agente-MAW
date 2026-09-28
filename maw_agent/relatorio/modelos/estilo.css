@@ -1,0 +1,42 @@
+/* maw_agent/relatorio/modelos/estilo.css */
+:root { --roxo: #7b4dff; --roxo-escuro: #2a1d4d; --fundo-capa: #0e0e11; --texto: #1d1d22; --cinza: #6b6b76;
+        --verde: #1f9d55; --amarelo: #c98a00; --vermelho: #d33a3a; }
+@page { size: A4; }
+@page paisagem { size: A4 landscape; }
+body { font-family: "Segoe UI", Arial, sans-serif; color: var(--texto); font-size: 10.5pt; line-height: 1.45; margin: 0; }
+h1 { font-size: 30pt; margin: 8mm 0 2mm; }
+h2 { font-size: 16pt; color: var(--roxo-escuro); border-bottom: 2px solid var(--roxo); padding-bottom: 2mm; margin-top: 8mm; }
+h3 { font-size: 12pt; margin: 5mm 0 2mm; }
+h4 { font-size: 10pt; margin: 3mm 0 1mm; color: var(--cinza); text-transform: uppercase; letter-spacing: .04em; }
+.mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 9pt; }
+section { break-inside: auto; }
+.quebra { break-before: page; }
+.capa { background: var(--fundo-capa); color: #eee; min-height: 262mm; padding: 18mm 14mm; box-sizing: border-box;
+        break-after: page; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+.capa .logo { height: 34mm; } .capa .logo-texto { font-size: 44pt; font-weight: 800; color: var(--roxo); }
+.capa .sub { color: #aaa; } .capa table { width: 100%; border-collapse: collapse; margin: 8mm 0; }
+.capa th, .capa td { border-bottom: 1px solid #333; padding: 2mm; text-align: left; font-size: 9.5pt; }
+.veredito { font-size: 13pt; border-left: 4px solid var(--roxo); padding-left: 4mm; }
+.intocada { font-weight: 700; } .intocada.ok { color: #58d68d; } .intocada.falha { color: #ff6b6b; }
+.sem { padding: .5mm 2mm; border-radius: 2mm; font-size: 8.5pt; font-weight: 700; color: #fff; }
+.sem.pronto { background: var(--verde); } .sem.com_ressalvas { background: var(--amarelo); } .sem.bloqueado { background: var(--vermelho); }
+.cartoes { display: flex; gap: 3mm; flex-wrap: wrap; margin: 4mm 0; }
+.cartao { border: 1px solid #ddd; border-radius: 2mm; padding: 2mm 4mm; min-width: 22mm; text-align: center; }
+.cartao b { display: block; font-size: 16pt; } .cartao span { color: var(--cinza); font-size: 8.5pt; }
+.cartao.critica b { color: var(--vermelho); } .cartao.alta b { color: #e8692c; }
+.ficha { border: 1px solid #ddd; border-left: 4px solid var(--roxo); border-radius: 1.5mm; padding: 3mm 4mm; margin: 4mm 0; break-inside: avoid; }
+.ficha.critica { border-left-color: var(--vermelho); } .ficha.alta { border-left-color: #e8692c; }
+.ficha.media { border-left-color: var(--amarelo); } .ficha.melhoria { border-left-color: var(--verde); }
+.meta { color: var(--cinza); font-size: 9pt; margin: 0; }
+.duas { display: flex; gap: 6mm; } .duas > div { flex: 1; }
+figure img { max-width: 100%; max-height: 90mm; border: 1px solid #ccc; } figcaption { font-size: 8.5pt; color: var(--cinza); }
+table.grade { width: 100%; border-collapse: collapse; font-size: 9pt; }
+table.grade th, table.grade td { border: 1px solid #ddd; padding: 1.5mm 2mm; text-align: left; vertical-align: top; }
+.paisagem { page: paisagem; break-before: page; }
+table.matriz { width: 100%; border-collapse: collapse; font-size: 7.5pt; }
+table.matriz th, table.matriz td { border: 1px solid #e3e3e3; padding: .8mm 1.2mm; }
+table.matriz thead { display: table-header-group; } table.matriz tr { break-inside: avoid; }
+td.c { text-align: center; font-weight: 700; }
+td.c.passou { color: var(--verde); } td.c.falhou { color: var(--vermelho); background: #fdeaea; }
+td.c.nao_testavel { color: #999; } td.c.na { color: #bbb; font-weight: 400; }
+.legenda { font-size: 8.5pt; color: var(--cinza); }
