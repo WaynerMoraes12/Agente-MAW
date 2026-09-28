@@ -1,0 +1,115 @@
+import subprocess
+from pathlib import Path
+import pytest
+from maw_agent import alvos
+
+def sh(*a, cwd):
+    return subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+def commit(repo: Path, arquivo: str, texto: str, msg: str) -> str:
+    (repo / arquivo).parent.mkdir(parents=True, exist_ok=True)
+    (repo / arquivo).write_text(texto)
+    sh("add", "-A", cwd=repo); sh("commit", "-qm", msg, cwd=repo)
+    return sh("rev-parse", "HEAD", cwd=repo)
+
+@pytest.fixture
+def mundo(tmp_path):
+    origem = tmp_path / "origem"; origem.mkdir()
+    sh("init", "-q", "-b", "main", cwd=origem)
+    sh("config", "user.email", "t@t", cwd=origem); sh("config", "user.name", "t", cwd=origem)
+    commit(origem, "Source/a.cpp", "1", "c1")
+    sh("checkout", "-qb", "feature/x", cwd=origem); commit(origem, "Source/a.cpp", "2", "x")
+    sh("checkout", "-q", "main", cwd=origem)
+    sh("checkout", "-qb", "docs/y", cwd=origem); commit(origem, "README.md", "doc", "y")
+    sh("checkout", "-q", "main", cwd=origem)
+    sh("checkout", "-qb", "feature/mesclada", cwd=origem); commit(origem, "Source/b.cpp", "b", "m")
+    sh("checkout", "-q", "main", cwd=origem); sh("merge", "-q", "--no-ff", "-m", "merge", "feature/mesclada", cwd=origem)
+    bare = tmp_path / "github.git"
+    sh("clone", "-q", "--bare", str(origem), str(bare), cwd=tmp_path)
+    return {"tmp": tmp_path, "origem": origem, "bare": bare}
+
+def test_espelho_sem_push(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    assert sh("remote", "get-url", "--push", "origin", cwd=esp) == "nao-faca-push"
+
+def test_descobre_main_e_branches_nao_mescladas(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    lista, avisos = alvos.descobrir_alvos(esp, [])
+    nomes = sorted(a.nome for a in lista)
+    assert nomes == ["docs-y", "feature-x", "main"]
+
+def test_mesma_arvore_de_codigo_compartilha(mundo):
+    # docs/z sai do main atual e só muda o README: mesma árvore de código
+    sh("checkout", "-qb", "docs/z", cwd=mundo["origem"]); commit(mundo["origem"], "README.md", "z", "z")
+    sh("push", "-q", str(mundo["bare"]), "docs/z", cwd=mundo["origem"])
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    lista, _ = alvos.descobrir_alvos(esp, [])
+    por_nome = {a.nome: a for a in lista}
+    assert por_nome["main"].compartilha_com is None
+    assert por_nome["docs-z"].compartilha_com == "main"
+    # docs/y saiu do main ANTES do merge: árvore diferente, não compartilha
+    assert por_nome["docs-y"].compartilha_com is None
+
+def _clone_do_usuario(mundo, nome, branch):
+    pasta = mundo["tmp"] / nome
+    sh("clone", "-q", "-b", branch, str(mundo["bare"]), str(pasta), cwd=mundo["tmp"])
+    sh("config", "user.email", "t@t", cwd=pasta); sh("config", "user.name", "t", cwd=pasta)
+    return pasta
+
+def test_clone_local_a_frente_vence(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    pasta = _clone_do_usuario(mundo, "MAW_a1", "feature/x")
+    novo = commit(pasta, "Source/a.cpp", "3", "local")
+    locais = alvos.importar_clones_locais(esp, [pasta])
+    lista, _ = alvos.descobrir_alvos(esp, locais)
+    x = [a for a in lista if a.branch == "feature/x"]
+    assert len(x) == 1 and x[0].commit == novo and x[0].origem == "local:MAW_a1"
+
+def test_clone_local_igual_nao_duplica(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    pasta = _clone_do_usuario(mundo, "MAW_a1", "feature/x")
+    lista, _ = alvos.descobrir_alvos(esp, alvos.importar_clones_locais(esp, [pasta]))
+    assert len([a for a in lista if a.branch == "feature/x"]) == 1
+
+def test_clone_local_divergente_entra_os_dois(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    pasta = _clone_do_usuario(mundo, "MAW_a1", "feature/x")
+    commit(pasta, "Source/a.cpp", "local", "local")
+    # GitHub anda por outro caminho
+    sh("checkout", "-q", "feature/x", cwd=mundo["origem"]); commit(mundo["origem"], "Source/c.cpp", "gh", "gh")
+    sh("push", "-q", str(mundo["bare"]), "feature/x", cwd=mundo["origem"])
+    alvos.garantir_espelho(esp, str(mundo["bare"]))
+    lista, _ = alvos.descobrir_alvos(esp, alvos.importar_clones_locais(esp, [pasta]))
+    assert len([a for a in lista if a.branch == "feature/x"]) == 2
+
+def test_clone_so_local_entra(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    pasta = _clone_do_usuario(mundo, "MAW_a6", "main")
+    sh("checkout", "-qb", "feature/so-local", cwd=pasta); c = commit(pasta, "Source/z.cpp", "z", "z")
+    lista, _ = alvos.descobrir_alvos(esp, alvos.importar_clones_locais(esp, [pasta]))
+    assert any(a.branch == "feature/so-local" and a.commit == c for a in lista)
+
+def test_clone_sujo_gera_aviso(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    pasta = _clone_do_usuario(mundo, "MAW_a1", "feature/x")
+    (pasta / "Source" / "a.cpp").write_text("sujo")
+    _, avisos = alvos.descobrir_alvos(esp, alvos.importar_clones_locais(esp, [pasta]))
+    assert any("MAW_a1" in a and "não commitadas" in a for a in avisos)
+
+def test_prova_intocada_detecta_mudanca_e_nao_escreve(mundo):
+    pasta = _clone_do_usuario(mundo, "MAW", "main")
+    idx = (pasta / ".git" / "index").stat().st_mtime_ns
+    antes = alvos.prova_intocada([pasta])
+    assert (pasta / ".git" / "index").stat().st_mtime_ns == idx
+    assert alvos.comparar_provas(antes, alvos.prova_intocada([pasta])) == []
+    (pasta / "Source" / "a.cpp").write_text("mexi")
+    difs = alvos.comparar_provas(antes, alvos.prova_intocada([pasta]))
+    assert difs and "MAW" in difs[0]
+
+def test_worktree_no_commit_do_alvo(mundo, tmp_path):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    lista, _ = alvos.descobrir_alvos(esp, [])
+    x = next(a for a in lista if a.nome == "feature-x")
+    wt = alvos.criar_worktree(esp, x, tmp_path / "alvos")
+    assert (wt / "Source" / "a.cpp").read_text() == "2"
+    assert alvos.criar_worktree(esp, x, tmp_path / "alvos") == wt  # reaproveita
