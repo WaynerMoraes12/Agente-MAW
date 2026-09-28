@@ -1,0 +1,12 @@
+[project]
+name = "maw-agent"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["pyyaml", "jinja2", "jsonschema", "playwright", "pypdf", "psutil",
+                "numpy", "soundfile", "pyloudnorm", "pywinauto", "pillow", "requests",
+                "mido", "python-rtmidi", "pyaudiowpatch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["lento: usa MSBuild, rede ou a MAW real (rodar com -m lento)"]
+addopts = "-m 'not lento'"
