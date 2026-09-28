@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Achado do Agente MAW",
+  "type": "object",
+  "required": ["titulo", "tipo", "alvos", "item_catalogo", "passos", "esperado", "obtido",
+               "evidencias", "sugestao", "criterio_aceite", "confianca", "assinatura"],
+  "properties": {
+    "titulo": {"type": "string", "minLength": 8},
+    "tipo": {"enum": ["erro", "bug", "violacao", "afirmacao_falsa", "lacuna", "melhoria"]},
+    "severidade": {"enum": ["critica", "alta", "media", "baixa", null]},
+    "prioridade": {"enum": ["alta", "media", "baixa", null]},
+    "alvos": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["alvo", "commit"],
+              "properties": {"alvo": {"type": "string"}, "commit": {"type": "string"}}}},
+    "item_catalogo": {"type": "string", "minLength": 3},
+    "principio": {"type": ["string", "null"]},
+    "passos": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "esperado": {"type": "string", "minLength": 3},
+    "obtido": {"type": "string", "minLength": 3},
+    "evidencias": {"type": "array", "items": {"type": "object", "required": ["arquivo", "legenda"],
+                   "properties": {"arquivo": {"type": "string"}, "legenda": {"type": "string"},
+                                  "embutir": {"type": "boolean"}}}},
+    "causa_provavel": {"type": ["object", "null"],
+                       "properties": {"arquivo_linha": {"type": "string"}, "texto": {"type": "string"}}},
+    "sugestao": {"type": "string", "minLength": 3},
+    "criterio_aceite": {"type": "string", "minLength": 8},
+    "confianca": {"enum": ["confirmado", "provavel"]},
+    "assinatura": {"type": "string", "minLength": 3},
+    "fonte": {"type": "string"},
+    "veredito": {"type": ["object", "null"]}
+  }
+}
