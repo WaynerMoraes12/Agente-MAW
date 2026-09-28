@@ -399,3 +399,26 @@ def test_erro_de_disco_durante_a_suite_nao_vira_recusa(sprint, monkeypatch):
     with pytest.raises(OSError):
         fases._suite(Args())
     assert (config.APPDATA_MAW / "MAW.settings").read_text(encoding="utf-8") == "<original/>"
+
+
+def test_compilar_conclui_a_fase_quando_todos_os_builds_rodaram(sprint, monkeypatch, capsys):
+    e = sprint["estado"]
+    monkeypatch.setattr(build, "compilar", lambda alvo, wt, cfg, logs: build.ResultadoBuild(
+        alvo, cfg, True, 1.0, [], [], "x.exe", "l.log"))
+    fases._compilar(Args())
+    s = estado.carregar(e.pasta)
+    assert s.feito("compilar:main:Release") and s.feito("compilar:main:Debug") and s.feito("compilar")
+
+
+def test_reverificacoes_escritas_a_mao_antes_da_consolidacao_valem_e_nao_realimentam(sprint):
+    e = sprint["estado"]
+    ultimo = dict(_achado_valido(), assinatura="Source/a.cpp::f::condicao")
+    sandbox.escrever_json(config.HISTORICO, {"proximo": 2, "itens": {"imp": {
+        "id": "MAW-0001", "estado": "aberto", "historico": ["00"], "ultimo": ultimo, "sprint_do_estado": "00"}}})
+    sandbox.escrever_json(e.pasta / "reverificacoes.json", {"MAW-0001": "corrigido"})
+    fases._consolidar(None)
+    [a] = _ler(e.pasta / "achados.json")
+    assert a["estado"] == "corrigido" and (e.pasta / "reverificacoes-manual.json").exists()
+    fases._consolidar(None)
+    [b] = _ler(e.pasta / "achados.json")
+    assert b == a and _ler(e.pasta / "erros_agente.json") == []

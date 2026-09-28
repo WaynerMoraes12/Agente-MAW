@@ -231,3 +231,12 @@ def test_metodo_declara_backup_que_nao_foi_apagado(tmp_path):
                                         "erro": "em uso", "backup_apagado": False}])
     ctx = contexto.montar(s, ITENS, [], None, None)
     assert any("mantido" in m and "C:/x/backups/1" in m for m in ctx["metodo"])
+
+
+def test_metodo_usa_o_desfecho_final_de_cada_backup(tmp_path):
+    s = _sprint(tmp_path)
+    _estado(s, FASES_OK, restauracoes=[
+        {"quem": "suite", "backup": "B1", "verificado": False, "erro": "em uso", "backup_apagado": False},
+        {"quem": "retomada", "backup": "B1", "verificado": True, "backup_apagado": True}])
+    [m] = contexto.montar(s, ITENS, [], None, None)["metodo"]
+    assert "foi apagado" in m and "1 tentativa(s)" in m and "mantido" not in m

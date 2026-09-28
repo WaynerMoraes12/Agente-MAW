@@ -88,15 +88,22 @@ def _prova(pasta: Path) -> list[dict]:
 
 
 def _metodo(estado: dict) -> list[str]:
-    out = []
+    """Um texto por backup do %APPDATA%\\MAW, pelo desfecho final (a última restauração dele)."""
+    por_backup: dict[str, list[dict]] = {}
     for r in estado.get("restauracoes", []):
+        por_backup.setdefault(str(r.get("backup")), []).append(r)
+    out = []
+    for backup, regs in por_backup.items():
+        r = regs[-1]
+        falhas = sum(1 for x in regs[:-1] if not x.get("verificado"))
+        antes = f", depois de {falhas} tentativa(s) de restauração com falha" if falhas else ""
         quando = r.get("quando", "?")
         if r.get("backup_apagado"):
             out.append(f"Um backup temporário das configurações da MAW (%APPDATA%\\MAW) existiu durante a execução "
-                       f"({r.get('quem', '?')}) e foi apagado depois da restauração verificada ({quando}).")
+                       f"({r.get('quem', '?')}) e foi apagado depois da restauração verificada ({quando}{antes}).")
         else:
             motivo = r.get("erro") or r.get("erro_ao_apagar") or "motivo não informado"
-            out.append(f"O backup temporário das configurações da MAW foi mantido em {r.get('backup')} "
+            out.append(f"O backup temporário das configurações da MAW foi mantido em {backup} "
                        f"porque a restauração ou a remoção falhou ({quando}): {motivo}.")
     return out
 
