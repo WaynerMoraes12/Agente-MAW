@@ -26,7 +26,7 @@ def semaforo(achados_do_alvo: list[dict], build_ok: bool) -> str:
               and a.get("confianca") == "confirmado"]
     if graves:
         return "bloqueado"
-    if [a for a in abertos if a.get("tipo") not in ("melhoria", "lacuna")]:
+    if abertos:
         return "com_ressalvas"
     return "pronto"
 
@@ -166,7 +166,12 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
             herdados = [x for x in achados_lista if x not in doalvo
                         and origem in {y["alvo"] for y in x["alvos"]}
                         and not x.get("item_catalogo", "").startswith("documentacao/")]
-        sem = semaforo(doalvo + herdados, build_ok)
+        combinados = doalvo + herdados
+        # a situação (semáforo) de uma branch só olha o que ela traz além do main: achados que
+        # também afetam o main não são "culpa" da branch. O próprio main continua vendo tudo.
+        achados_para_semaforo = combinados if a["nome"] == "main" \
+            else [x for x in combinados if "main" not in {y["alvo"] for y in x["alvos"]}]
+        sem = semaforo(achados_para_semaforo, build_ok)
         suite_alvo = _ler(pasta / "suites" / f"{origem}.json")
         if suite_alvo and not a.get("compartilha_com"):
             if suite_alvo.get("captura_erro"):

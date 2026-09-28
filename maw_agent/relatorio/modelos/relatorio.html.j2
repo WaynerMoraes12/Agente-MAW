@@ -13,6 +13,7 @@
     {% for a in alvos %}<tr><td>{{ a.nome }}</td><td>{{ a.branch }}</td><td class="mono">{{ a.commit[:10] }}</td>
       <td>{{ a.origem }}</td><td><span class="sem {{ a.semaforo }}">{{ a.semaforo_rotulo }}</span></td></tr>{% endfor %}
   </table>
+  <p class="legenda">Para as branches, a situação considera só os achados que não existem no main; o que é comum aos dois aparece no main.</p>
   <p class="veredito">{{ veredito }}</p>
   <p class="intocada {{ 'ok' if intocada.verificado else 'falha' }}">
     {% if intocada.verificado %}MAW intocada: verificado{% else %}MAW intocada: NÃO verificado — {{ intocada.diferencas | join('; ') }}{% endif %}
@@ -50,6 +51,7 @@
 
 <section>
   <h2>3. Por alvo</h2>
+  <p class="legenda">Para as branches, a situação considera só os achados que não existem no main; o que é comum aos dois aparece no main.</p>
   {% for a in alvos %}
   <div class="alvo">
     <h3>{{ a.nome }} <span class="sem {{ a.semaforo }}">{{ a.semaforo_rotulo }}</span></h3>

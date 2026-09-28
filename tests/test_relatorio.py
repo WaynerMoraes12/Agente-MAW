@@ -37,6 +37,11 @@ def test_semaforo():
     assert contexto.semaforo([ACHADO], True) == "bloqueado"
     assert contexto.semaforo([dict(ACHADO, severidade="baixa")], True) == "com_ressalvas"
     assert contexto.semaforo([dict(ACHADO, confianca="provavel")], True) == "com_ressalvas"
+    # melhoria (mesmo grave) e lacuna leve abertas não bloqueiam, mas também não são "pronto": há
+    # ressalva a registrar. Uma lacuna grave e confirmada continua bloqueando (não é "não-melhoria"
+    # que o achado deixa de ser só por ser lacuna).
+    assert contexto.semaforo([dict(ACHADO, tipo="melhoria")], True) == "com_ressalvas"
+    assert contexto.semaforo([dict(ACHADO, tipo="lacuna", severidade="baixa")], True) == "com_ressalvas"
 
 def test_contexto_completo_e_matriz_sem_buraco(tmp_path):
     ctx = contexto.montar(_sprint(tmp_path), ITENS, [], None, None)
@@ -191,7 +196,36 @@ def test_alvo_que_compartilha_herda_achados_da_origem(tmp_path):
     docs = next(a for a in ctx["alvos"] if a["nome"] == "docs-z")
     assert docs["herdados"] == ["MAW-0002"]           # documentação é revisada por alvo: não herda
     assert "MAW-0002" in docs["achados_ids"]
-    assert docs["semaforo"] == "bloqueado"           # o achado grave herdado conta
+    # MAW-0002 também afeta o main (está em seus alvos): não é algo que docs-z trouxe, então não
+    # conta para a situação de docs-z, mesmo herdado — só o main vê todos os seus achados abertos.
+    assert docs["semaforo"] == "pronto"
+
+
+# ---------- semáforo da branch considera só o que ela traz além do main ----------
+
+def test_achado_presente_tambem_no_main_nao_bloqueia_a_branch(tmp_path):
+    s = _sprint(tmp_path)
+    (s / "builds").mkdir()
+    for nome in ("main", "feature-x"):
+        (s / "builds" / f"{nome}-Release.json").write_text(json.dumps({"ok": True, "segundos": 1, "avisos": []}))
+    # achado grave, mas presente nos dois alvos: não foi a branch que introduziu, já existe no main
+    comum = dict(ACHADO, id="MAW-0005", introduzido_por=None,
+                 alvos=[{"alvo": "feature-x", "commit": "b" * 40}, {"alvo": "main", "commit": "a" * 40}])
+    (s / "achados.json").write_text(json.dumps([comum]))
+    ctx = contexto.montar(s, ITENS, [], None, None)
+    por_nome = {a["nome"]: a["semaforo"] for a in ctx["alvos"]}
+    assert por_nome["main"] == "bloqueado"        # o main considera todos os seus achados abertos
+    assert por_nome["feature-x"] == "pronto"      # a branch não trouxe nada além do que já existe no main
+
+
+def test_branch_com_apenas_melhoria_aberta_fica_com_ressalvas(tmp_path):
+    s = _sprint(tmp_path)
+    (s / "builds").mkdir()
+    (s / "builds" / "feature-x-Release.json").write_text(json.dumps({"ok": True, "segundos": 1, "avisos": []}))
+    melhoria = dict(ACHADO, id="MAW-0006", tipo="melhoria", estado="novo")
+    (s / "achados.json").write_text(json.dumps([melhoria]))
+    ctx = contexto.montar(s, ITENS, [], None, None)
+    assert {a["nome"]: a["semaforo"] for a in ctx["alvos"]}["feature-x"] == "com_ressalvas"
 
 
 # ---------- menores do relatório ----------
