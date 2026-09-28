@@ -42,6 +42,16 @@ def registrar_resultado(pasta_sprint: Path, item: str, alvo: str, resultado: str
     sandbox.escrever_texto(p, anterior + linha + "\n")
 
 
+def descartar_fonte(pasta_sprint: Path, fonte: str) -> None:
+    """Tira de resultados.jsonl as linhas gravadas por `fonte` (a consolidação refaz as suas)."""
+    p = Path(pasta_sprint) / "resultados.jsonl"
+    if not p.exists():
+        return
+    linhas = [l for l in p.read_text(encoding="utf-8").splitlines()
+              if l.strip() and json.loads(l).get("fonte") != fonte]
+    sandbox.escrever_texto(p, "".join(l + "\n" for l in linhas))
+
+
 def carregar_resultados(pasta_sprint: Path) -> dict[tuple[str, str], dict]:
     p = Path(pasta_sprint) / "resultados.jsonl"
     out: dict[tuple[str, str], dict] = {}

@@ -42,3 +42,12 @@ def test_resultado_invalido_levanta(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         catalogo.registrar_resultado(tmp_path, "a/um", "main", "talvez")
+
+def test_descartar_fonte_tira_so_as_linhas_daquela_fonte(tmp_path):
+    catalogo.registrar_resultado(tmp_path, "a/um", "main", "passou", fonte="suite")
+    catalogo.registrar_resultado(tmp_path, "a/um", "main", "falhou", achados=["X"], fonte="consolidacao")
+    catalogo.registrar_resultado(tmp_path, "a/dois", "main", "falhou", fonte="consolidacao")
+    catalogo.descartar_fonte(tmp_path, "consolidacao")
+    r = catalogo.carregar_resultados(tmp_path)
+    assert r[("a/um", "main")]["resultado"] == "passou" and ("a/dois", "main") not in r
+    catalogo.descartar_fonte(tmp_path / "nao-existe", "x")  # sem arquivo: nada acontece
