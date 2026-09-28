@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from maw_agent import build, catalogo, config, estado, fases, sandbox, suite
+from maw_agent import build, catalogo, config, estado, fases, sandbox, sondas, suite
 from maw_agent.cli import main
 
 COMMIT = "a" * 40
@@ -47,6 +47,9 @@ def sprint(tmp_path, monkeypatch):
     cat = tmp_path / "funcionalidades.yaml"
     cat.write_text(yaml.safe_dump(ITENS, allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(config, "CATALOGO", cat)
+    # sondas do agente: nenhuma, a não ser que o teste ponha (nunca as do privado de verdade)
+    monkeypatch.setattr(sondas, "PASTA_PRIVADA", tmp_path / "privado" / "sondas")
+    monkeypatch.setattr(sondas, "MAPA", tmp_path / "privado" / "sondas" / "itens.yaml")
     monkeypatch.setattr(sandbox, "ESPERAS", (0, 0, 0, 0))
     e = estado.nova_sprint(raiz)
     monkeypatch.setattr(fases, "_sprint_atual", lambda: estado.carregar(e.pasta))
@@ -547,3 +550,232 @@ def test_restauracao_pendente_da_propria_sprint_nao_se_perde_quando_a_suite_salv
     assert fases._suite(Args()) == 0
     quem = [r["quem"] for r in estado.carregar(e.pasta).restauracoes]
     assert quem == ["retomada", "suite"]
+
+
+# ---------- sondas do agente: suíte e build ----------
+
+SAIDA_COM_SONDA = ("NOME - suite de testes automatizados (juce::UnitTest)\r\n"
+                   "[ok]     Bloco A  ->  faz x   (5 ok, 0 falha(s))\r\n"
+                   "[FALHOU] SONDA Andamento  ->  clipe dividido   (1 ok, 2 falha(s))\r\n"
+                   "[ok]     SONDA Andamento  ->  120 BPM   (3 ok, 0 falha(s))\r\n"
+                   "Blocos de teste ........ 3\r\nVerificacoes que deram ok 9\r\nVerificacoes que falharam 2\r\n"
+                   "Tempo total ............ 10 ms\r\nRESULTADO: FALHOU.\r\n"
+                   "Detalhe das falhas\r\n- SONDA Andamento / clipe dividido\r\n"
+                   "!!! Test 1 failed: a metade da direita tem 140 BPM e T mediu 115.58 BPM\r\n")
+ITEM_SONDA = {"id": "area/andamento", "area": "area", "titulo": "t", "descricao": "d", "origem": ["x"],
+              "verificacao": ["suite", "sonda"], "cenarios": [], "requisitos": [], "marco": "M5"}
+SONDA_A = 'struct SondaA : juce::UnitTest { SondaA() : juce::UnitTest ("SONDA Andamento", "MAW") {} };\n'
+SONDA_B = 'struct SondaB : juce::UnitTest { SondaB() : juce::UnitTest ("SONDA Audio", "MAW") {} };\n'
+PROJETO = ('<?xml version="1.0" encoding="utf-8"?>\r\n'
+           '<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">\r\n'
+           '  <Import Project="$(VCTargetsPath)\\Microsoft.Cpp.targets" />\r\n</Project>\r\n')
+
+
+def _com_sondas(tmp: Path, projeto: bool = True) -> None:
+    """Duas sondas no privado falso, o mapa e (opcional) o projeto da worktree do main."""
+    sondas.PASTA_PRIVADA.mkdir(parents=True, exist_ok=True)
+    (sondas.PASTA_PRIVADA / "SondaA.cpp").write_text(SONDA_A, encoding="utf-8")
+    (sondas.PASTA_PRIVADA / "SondaB.cpp").write_text(SONDA_B, encoding="utf-8")
+    sondas.MAPA.write_text('"SONDA Andamento": [area/andamento]\n"SONDA Audio": [area/audio, principio/P4]\n',
+                           encoding="utf-8")
+    cat = yaml.safe_load(config.CATALOGO.read_text(encoding="utf-8")) + [ITEM_SONDA]
+    config.CATALOGO.write_text(yaml.safe_dump(cat, allow_unicode=True), encoding="utf-8")
+    if projeto:
+        p = config.ALVOS_DIR / "main" / sondas.PROJETO
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(PROJETO.encode("utf-8"))
+
+
+def _sem_jassert(monkeypatch):
+    class Captura:
+        erro = None
+        mensagens = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+    monkeypatch.setattr(fases.saude, "CapturaDepuracao", Captura)
+
+
+def test_sonda_que_falha_nao_quebra_a_suite_existente_e_vira_achado_no_item_dela(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    _sem_jassert(monkeypatch)
+    monkeypatch.setattr(suite, "rodar_suite", lambda exe, cwd, timeout=1800, env=None:
+                        suite.interpretar_suite(SAIDA_COM_SONDA, 1, 1.0))
+    sprint["compilado"]("Debug")
+    sprint["compilado"]("Release")
+    assert fases._suite(Args()) == 0
+    r = _resultados(e)
+    assert r[("saude/suite-existente", "main")]["resultado"] == "passou"  # a suíte da MAW passou
+    assert r[("area/so-suite", "main")]["resultado"] == "passou"
+    assert r[("area/andamento", "main")]["resultado"] == "falhou"
+    assert r[("area/andamento", "docs-z")]["resultado"] == "falhou"  # herdado da mesma árvore
+    brutos = sorted(p.name for p in (e.pasta / "achados-brutos").glob("*.json"))
+    assert brutos == ["sonda-main-000.json"]  # nenhum "Teste da suíte falha"
+    a = _ler(e.pasta / "achados-brutos" / "sonda-main-000.json")
+    assert a["fonte"] == "sonda" and a["item_catalogo"] == "area/andamento"
+    assert a["causa_provavel"]["arquivo_linha"] == "privado/sondas/SondaA.cpp"
+    assert "115.58" in a["obtido"] and "SondaA.cpp" in " ".join(a["passos"])
+    d = _ler(e.pasta / "suites" / "main.json")
+    assert d["passou"] is True and d["total_falhas"] == 0 and [b["nome"] for b in d["blocos"]] == ["Bloco A"]
+    assert d["sondas"]["total_falhas"] == 2 and len(d["sondas"]["blocos"]) == 2
+    assert any("115.58" in l for l in d["sondas"]["detalhes"]) and d["detalhes"] == []
+
+
+def test_sonda_que_nao_rodou_diz_o_motivo_no_item(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    sandbox.escrever_json(e.pasta / "sondas.json", {"main": {
+        "injetadas": [], "ausentes": {"SONDA Andamento": "sonda não compila em main: SondaA.cpp(3): error C2065"}}})
+    sprint["compilado"]("Debug")
+    fases._suite(Args())
+    motivo = _resultados(e)[("area/andamento", "main")]["motivo"]
+    assert "SONDA Andamento: sonda não compila em main" in motivo
+
+
+def test_suite_que_nao_rodou_marca_os_itens_das_sondas(sprint):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    fases._suite(Args())  # sem build nesta sprint
+    r = _resultados(e)
+    assert r[("area/andamento", "main")]["resultado"] == "nao_testavel"
+    assert "build Debug" in r[("area/andamento", "main")]["motivo"]
+
+
+class _BuildFalso:
+    """build.compilar falso: devolve os resultados da fila (Debug) e registra as sondas presentes
+    na worktree a cada chamada."""
+
+    def __init__(self, erros_debug: list[list[str]]):
+        self.fila = list(erros_debug)
+        self.chamadas: list[tuple[str, list[str]]] = []
+
+    def __call__(self, alvo, wt, cfg, logs):
+        pasta = Path(wt) / sondas.PASTA_NA_WORKTREE
+        self.chamadas.append((cfg, sorted(p.name for p in pasta.glob("*.cpp")) if pasta.is_dir() else []))
+        erros = self.fila.pop(0) if cfg == "Debug" and self.fila else []
+        log = Path(logs) / f"build-{alvo}-{cfg}.log"
+        sandbox.escrever_texto(log, "\n".join(erros) or "ok")
+        return build.ResultadoBuild(alvo, cfg, not erros, 1.0, [], erros, None if erros else "x.exe", str(log))
+
+
+ERRO_SONDA = r"C:\w\alvos\main\Source\Tests\Sondas\SondaA.cpp(3,1): error C2065: 'x': undeclared identifier"
+ERRO_MAW = r"C:\w\alvos\main\Source\Audio\Motor.cpp(9,2): error C2143: syntax error: missing ';'"
+
+
+def test_compilar_injeta_as_sondas_so_antes_do_debug(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    falso = _BuildFalso([])
+    monkeypatch.setattr(build, "compilar", falso)
+    assert fases._compilar(Args()) == 0
+    assert falso.chamadas == [("Release", []), ("Debug", ["SondaA.cpp", "SondaB.cpp"])]
+    projeto = (config.ALVOS_DIR / "main" / sondas.PROJETO).read_text(encoding="utf-8")
+    assert "SondasDoAgente" in projeto and "Debug" in projeto
+    info = _ler(e.pasta / "sondas.json")["main"]
+    assert info["injetadas"] == ["SondaA.cpp", "SondaB.cpp"] and info["ausentes"] == {}
+    assert _resultados(e)[("saude/build-debug", "main")]["resultado"] == "passou"
+
+
+def test_sonda_que_nao_compila_vira_limitacao_e_o_debug_recompila_sem_ela(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    falso = _BuildFalso([[ERRO_SONDA]])
+    monkeypatch.setattr(build, "compilar", falso)
+    assert fases._compilar(Args()) == 0
+    assert falso.chamadas == [("Release", []), ("Debug", ["SondaA.cpp", "SondaB.cpp"]), ("Debug", ["SondaB.cpp"])]
+    assert _ler(e.pasta / "builds" / "main-Debug.json")["ok"] is True
+    assert not (e.pasta / "achados-brutos").exists()  # não é falha de build da MAW
+    lim = _ler(e.pasta / "limitacoes-sondas.json")
+    assert any(l.startswith("sonda não compila em main: SondaA.cpp") and "C2065" in l for l in lim)
+    info = _ler(e.pasta / "sondas.json")["main"]
+    assert info["injetadas"] == ["SondaB.cpp"] and "SondaA.cpp" in info["excluidas"]
+    assert "não compila" in info["ausentes"]["SONDA Andamento"]
+    r = _resultados(e)
+    assert r[("saude/build-debug", "main")]["resultado"] == "passou"
+    assert r[("area/andamento", "main")]["resultado"] == "nao_testavel"
+    assert "não compila" in r[("area/andamento", "main")]["motivo"]
+    # o log da tentativa com a sonda fica como evidência
+    assert (e.pasta / "evidencias" / "builds" / "build-main-Debug-com-sondas-1.log").read_text(
+        encoding="utf-8").startswith(ERRO_SONDA)
+
+
+def test_erro_da_maw_com_sondas_injetadas_vira_achado_de_build(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    falso = _BuildFalso([[ERRO_MAW], [ERRO_MAW]])  # com e sem as sondas: a falha é da MAW
+    monkeypatch.setattr(build, "compilar", falso)
+    assert fases._compilar(Args()) == 1
+    assert falso.chamadas[1:] == [("Debug", ["SondaA.cpp", "SondaB.cpp"]), ("Debug", [])]
+    a = _ler(e.pasta / "achados-brutos" / "build-main-Debug.json")
+    assert "Motor.cpp" in a["obtido"] and "Sondas" not in a["obtido"]
+    lim = _ler(e.pasta / "limitacoes-sondas.json")
+    assert not any(l.startswith("sonda não compila") for l in lim)
+    assert any("falha é da MAW" in l for l in lim)
+
+
+def test_erro_misto_so_a_parte_da_maw_vira_achado(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    falso = _BuildFalso([[ERRO_SONDA, ERRO_MAW], [ERRO_MAW], [ERRO_MAW]])
+    monkeypatch.setattr(build, "compilar", falso)
+    assert fases._compilar(Args()) == 1
+    assert [c[1] for c in falso.chamadas[1:]] == [["SondaA.cpp", "SondaB.cpp"], ["SondaB.cpp"], []]
+    a = _ler(e.pasta / "achados-brutos" / "build-main-Debug.json")
+    assert "Motor.cpp" in a["obtido"] and "SondaA" not in a["obtido"]
+    lim = _ler(e.pasta / "limitacoes-sondas.json")
+    assert any(l.startswith("sonda não compila em main: SondaA.cpp") for l in lim)
+
+
+def test_injecao_que_falha_vira_limitacao_e_o_build_segue(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"], projeto=False)  # sem .vcxproj: a injeção não tem onde pôr as sondas
+    falso = _BuildFalso([])
+    monkeypatch.setattr(build, "compilar", falso)
+    assert fases._compilar(Args()) == 0
+    assert [c[0] for c in falso.chamadas] == ["Release", "Debug"]
+    lim = _ler(e.pasta / "limitacoes-sondas.json")
+    assert any(l.startswith("sondas não injetadas em main:") for l in lim)
+    assert "não injetadas" in _ler(e.pasta / "sondas.json")["main"]["ausentes"]["SONDA Audio"]
+
+
+def test_sem_sondas_no_privado_nao_injeta_nada(sprint, monkeypatch):
+    e = sprint["estado"]
+    p = config.ALVOS_DIR / "main" / sondas.PROJETO
+    p.parent.mkdir(parents=True)
+    p.write_bytes(PROJETO.encode("utf-8"))
+    falso = _BuildFalso([])
+    monkeypatch.setattr(build, "compilar", falso)
+    fases._compilar(Args())
+    assert p.read_bytes() == PROJETO.encode("utf-8") and not (e.pasta / "sondas.json").exists()
+
+
+def test_mapa_das_sondas_ilegivel_vira_limitacao_e_a_suite_roda(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    sondas.MAPA.write_text("{isto: [nao fecha\n", encoding="utf-8")
+    _sem_jassert(monkeypatch)
+    monkeypatch.setattr(suite, "rodar_suite", lambda exe, cwd, timeout=1800, env=None:
+                        suite.interpretar_suite(SAIDA_COM_SONDA, 1, 1.0))
+    sprint["compilado"]("Debug")
+    assert fases._suite(Args()) == 0
+    assert any("mapa de itens das sondas ilegível" in l for l in _ler(e.pasta / "limitacoes-sondas.json"))
+    a = _ler(e.pasta / "achados-brutos" / "sonda-main-000.json")
+    assert a["item_catalogo"] == "saude/geral"
+
+
+def test_suite_incoerente_com_sondas_declara_que_nao_da_para_separar(sprint, monkeypatch):
+    e = sprint["estado"]
+    _com_sondas(sprint["tmp"])
+    _sem_jassert(monkeypatch)
+    morreu = SAIDA_COM_SONDA.split("Blocos de teste")[0]  # a execução morreu antes dos totais
+    monkeypatch.setattr(suite, "rodar_suite", lambda exe, cwd, timeout=1800, env=None:
+                        suite.interpretar_suite(morreu, -1073741819, 1.0))
+    sprint["compilado"]("Debug")
+    fases._suite(Args())
+    assert any("incoerente com as sondas" in l for l in _ler(e.pasta / "limitacoes-sondas.json"))
+    assert _resultados(e)[("saude/suite-existente", "main")]["resultado"] == "falhou"

@@ -44,6 +44,24 @@ def _dispositivos_audio() -> list[str]:
         return [f"(erro ao listar: {e})"]
 
 
+def _loopback_padrao() -> str | None:
+    """Nome do dispositivo de loopback WASAPI da saída de áudio padrão, se existir.
+
+    Sem VB-Cable (decisão de 28/09), este é o caminho de observação independente: a MAW
+    toca pela placa interna e o agente captura por aqui. Nunca levanta: PortAudio
+    ausente/quebrado ou nenhum loopback disponível viram None (limitação declarada,
+    não erro escondido)."""
+    try:
+        import pyaudiowpatch as pa
+        p = pa.PyAudio()
+        try:
+            return p.get_default_wasapi_loopback()["name"]
+        finally:
+            p.terminate()
+    except Exception:
+        return None
+
+
 def _portas_midi() -> list[str]:
     try:
         import mido
@@ -141,8 +159,15 @@ def verificar_tudo() -> list[Verificacao]:
     vs.append(Verificacao("disco", livre >= 30, f"{livre:.0f} GB livres (mínimo 30)", True, []))
     audio = _dispositivos_audio()
     cabo = any("CABLE" in d.upper() for d in audio)
-    vs.append(Verificacao("vb_cable", cabo, "VB-Cable presente" if cabo else "VB-Cable não instalado",
+    vs.append(Verificacao("entrada_injetavel", cabo,
+                          "cabo virtual presente: dá para injetar sinal conhecido na entrada da MAW" if cabo else
+                          "nenhum cabo virtual instalado: sem entrada injetável (modo placa interna, sem "
+                          "sinal conhecido na entrada)",
                           False, ["vb-cable"]))
+    loop_padrao = _loopback_padrao()
+    vs.append(Verificacao("loopback", loop_padrao is not None,
+                          loop_padrao or "nenhum dispositivo de loopback da saída padrão (pyaudiowpatch)",
+                          False, ["loopback"]))
     py_path, py_detail = _python310()
     vs.append(Verificacao("python310", py_path is not None, py_path or py_detail,
                           False, ["python310"]))

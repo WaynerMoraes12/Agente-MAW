@@ -1,6 +1,8 @@
-# Agente MAW
+# Roadie
 
-Agente de testes da **MAW** (uma DAW para Windows). A cada sprint ele testa
+**Roadie** é o agente de testes da **MAW** (uma DAW para Windows). Como o roadie de
+uma banda, ele testa cada cabo, microfone e instrumento antes do show, mas nunca
+sobe ao palco para tocar. A cada sprint ele testa
 **tudo, sempre, de ponta a ponta**, no `main` e em cada branch aberta, e entrega
 um **PDF** com os achados: um resumo para quem decide o merge e fichas técnicas
 exatas para quem vai corrigir, seja pessoa ou agente de IA.

@@ -1,11 +1,46 @@
-"""Estado persistente de uma sprint: cada passo concluído fica gravado, e a retomada o pula."""
+"""Estado persistente de uma sprint: cada passo concluído fica gravado, e a retomada o pula.
+
+Vários processos gravam o mesmo `estado.json` ao mesmo tempo (o script noturno, a compilação e o
+`claude -p` marcando passos): toda mudança pega a trava `estado.lock`, relê o arquivo, mexe só na
+sua chave e grava de forma atômica — ninguém apaga o passo de outro."""
 from __future__ import annotations
 import json
+import msvcrt
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 from . import config, sandbox
+
+ESPERA_TRAVA = 60.0  # segundos esperando outro processo soltar a trava antes de desistir
+
+
+@contextmanager
+def _trava(pasta: Path):
+    """Trava entre processos (e entre threads) sobre o primeiro byte de `estado.lock`."""
+    caminho = sandbox.garantir_escrita(Path(pasta) / "estado.lock")
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    f = open(caminho, "a+b")
+    try:
+        limite = time.monotonic() + ESPERA_TRAVA
+        while True:
+            try:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= limite:
+                    raise TimeoutError(f"estado.lock de {Path(pasta).name} ocupado há mais de {ESPERA_TRAVA:.0f} s")
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        f.close()
 
 FASES = ("preflight", "preparar", "compilar", "catalogar", "executar", "verificar",
          "consolidar", "encerrar", "relatorio")
@@ -34,24 +69,39 @@ class Estado:
         return self.passos.get(passo, {}).get("detalhe")
 
     def iniciar(self, passo: str) -> None:
-        self.passos[passo] = {"status": "em_andamento", "inicio": self._agora()}
-        self.salvar()
+        self._mudar(lambda: self.passos.__setitem__(passo, {"status": "em_andamento", "inicio": self._agora()}))
 
     def concluir(self, passo: str, detalhe: dict | None = None) -> None:
-        p = self.passos.setdefault(passo, {"inicio": self._agora()})
-        p.update({"status": "concluido", "fim": self._agora(), "detalhe": detalhe})
-        self.salvar()
+        def mudar():
+            p = self.passos.setdefault(passo, {"inicio": self._agora()})
+            p.update({"status": "concluido", "fim": self._agora(), "detalhe": detalhe})
+        self._mudar(mudar)
 
     def falhar(self, passo: str, erro: str) -> None:
-        p = self.passos.setdefault(passo, {"inicio": self._agora()})
-        p.update({"status": "falhou", "fim": self._agora(), "erro": erro})
-        self.salvar()
+        def mudar():
+            p = self.passos.setdefault(passo, {"inicio": self._agora()})
+            p.update({"status": "falhou", "fim": self._agora(), "erro": erro})
+        self._mudar(mudar)
 
     def registrar_restauracao(self, registro: dict) -> None:
-        self.restauracoes.append({"quando": self._agora(), **registro})
-        self.salvar()
+        self._mudar(lambda: self.restauracoes.append({"quando": self._agora(), **registro}))
+
+    def _mudar(self, mudanca: Callable[[], None]) -> None:
+        """Trava → relê o disco (o que outro processo gravou) → aplica só esta mudança → grava."""
+        with _trava(self.pasta):
+            arq = self.pasta / "estado.json"
+            if arq.exists():
+                d = json.loads(arq.read_text(encoding="utf-8"))
+                self.passos = d.get("passos", {})
+                self.restauracoes = d.get("restauracoes", [])
+            mudanca()
+            self._gravar()
 
     def salvar(self) -> None:
+        with _trava(self.pasta):
+            self._gravar()
+
+    def _gravar(self) -> None:
         sandbox.escrever_json(self.pasta / "estado.json",
                               {"numero": self.numero, "criado": self.criado, "passos": self.passos,
                                "restauracoes": self.restauracoes})

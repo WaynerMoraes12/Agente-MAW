@@ -1,5 +1,6 @@
 """HTML (Jinja2) → PDF pelo Edge do Windows (Playwright, canal msedge) + anexo JSON (pypdf)."""
 from __future__ import annotations
+import html
 import io
 from pathlib import Path
 
@@ -20,17 +21,23 @@ def _html(ctx: dict) -> str:
     return env.get_template("relatorio.html.j2").render(**ctx, css=css)
 
 
+def _rodape(ctx: dict) -> str:
+    """Rodapé de cada página (o cabeçalho fica vazio): título do relatório e número da página."""
+    titulo = html.escape(f"{ctx['titulo']} · {ctx['subtitulo']}")
+    return ('<div style="font-size:8px;width:100%;padding:0 12mm;color:#666;display:flex;justify-content:space-between">'
+            f'<span>{titulo}</span>'
+            '<span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>')
+
+
 def renderizar(ctx: dict, destino: Path) -> Path:
     destino = sandbox.garantir_escrita(Path(destino))
-    html = _html(ctx)
-    rodape = ('<div style="font-size:8px;width:100%;padding:0 12mm;color:#666;display:flex;justify-content:space-between">'
-              f'<span>MAW — Relatório de testes · {ctx["sprint"]}</span>'
-              '<span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>')
+    documento = _html(ctx)
+    rodape = _rodape(ctx)
     with sync_playwright() as pw:
         nav = pw.chromium.launch(channel="msedge")
         try:
             pagina = nav.new_page()
-            pagina.set_content(html, wait_until="load")
+            pagina.set_content(documento, wait_until="load")
             dados = pagina.pdf(format="A4", print_background=True, display_header_footer=True,
                                header_template="<span></span>", footer_template=rodape,
                                margin={"top": "14mm", "bottom": "16mm", "left": "12mm", "right": "12mm"},

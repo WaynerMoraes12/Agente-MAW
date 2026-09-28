@@ -40,3 +40,11 @@ td.c { text-align: center; font-weight: 700; }
 td.c.passou { color: var(--verde); } td.c.falhou { color: var(--vermelho); background: #fdeaea; }
 td.c.nao_testavel { color: #999; } td.c.na { color: #bbb; font-weight: 400; }
 .legenda { font-size: 8.5pt; color: var(--cinza); }
+td.estado { font-weight: 700; white-space: nowrap; }
+td.estado.passou, td.estado.detectado { color: var(--verde); }
+td.estado.problema, td.estado.nao_detectado { color: var(--vermelho); }
+td.estado.pulei, td.estado.erro { color: var(--amarelo); }
+td.estado.sem_resultado { color: #999; font-weight: 400; }
+table.bancada tr { break-inside: avoid; }
+table.bancada { table-layout: fixed; } table.bancada th:nth-child(1) { width: 16%; }
+table.bancada th:nth-child(2) { width: 30%; } table.bancada th:nth-child(3) { width: 14%; }

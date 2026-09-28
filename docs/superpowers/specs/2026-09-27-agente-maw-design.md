@@ -1,4 +1,4 @@
-# Agente MAW: design
+# Roadie (agente de testes da MAW): design
 
 **Data:** 2026-09-27
 **Autor:** Claude (com Wayner)
@@ -306,8 +306,26 @@ independente → evidência**.
 - **Evidência:** tudo vai para `evidencias/<alvo>/<cenario>/`, e o PDF recebe
   o essencial.
 
-**Dispositivos de áudio.** O VB-Cable gratuito é um cabo só, então a
-configuração de dispositivos da MAW muda **por grupo de cenários**:
+**Dispositivos de áudio.** Dois modos, conforme o que o pré-voo encontra
+(verificações `entrada_injetavel` e `loopback`):
+
+**Placa interna (modo padrão — decisão de 28/09, sem VB-Cable no ambiente).** A
+MAW toca pela placa de som interna do Windows e o agente observa pelo loopback
+WASAPI da saída padrão (`pyaudiowpatch`). Sem cabo virtual não há como injetar
+um sinal conhecido na entrada da MAW: gravação com sinal conhecido, afinador e
+qualquer cenário que dependa de um sinal controlado na entrada viram *pulei*/
+*não testável* com o motivo. O que depende só da saída — nível, frequência,
+mute, solo, pan, latência, fades, automação, metrônomo — continua medido pelo
+loopback.
+
+| Grupo | Saída da MAW | Entrada da MAW | O agente |
+|---|---|---|---|
+| reprodução | placa interna | — | captura por loopback |
+| monitoração | placa interna | — | injeta e captura pelo mesmo loopback |
+| gravação com sinal conhecido | — | — | *pulei*: sem cabo virtual, não há como injetar |
+
+**Com VB-Cable (se `entrada_injetavel` estiver ok).** O cabo gratuito é um cabo
+só, então a configuração de dispositivos da MAW muda **por grupo de cenários**:
 
 | Grupo | Saída da MAW | Entrada da MAW | O agente |
 |---|---|---|---|

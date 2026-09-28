@@ -39,3 +39,60 @@ def test_anterior_e_a_ultima_concluida(tmp_path):
 def test_falha_registrada(tmp_path):
     e = estado.nova_sprint(tmp_path); e.iniciar("x"); e.falhar("x", "boom")
     assert estado.carregar(e.pasta).passos["x"]["status"] == "falhou"
+
+
+def test_duas_instancias_do_mesmo_estado_nao_se_apagam(tmp_path):
+    base = estado.nova_sprint(tmp_path)
+    a = estado.carregar(base.pasta)
+    b = estado.carregar(base.pasta)  # outro processo, carregado antes da mudança de A
+    a.concluir("catalogar:main")
+    b.concluir("compilar:main:Release", {"ok": True})
+    r = estado.carregar(base.pasta)
+    assert r.feito("catalogar:main") and r.feito("compilar:main:Release")
+    assert b.feito("catalogar:main")  # quem grava enxerga o que já estava no disco
+
+
+def test_iniciar_falhar_e_restauracao_tambem_mesclam(tmp_path):
+    base = estado.nova_sprint(tmp_path)
+    a, b = estado.carregar(base.pasta), estado.carregar(base.pasta)
+    a.iniciar("suite:main")
+    b.falhar("noturno:julgamento-revisao", "código 1")
+    a.registrar_restauracao({"quem": "suite", "verificado": True})
+    b.registrar_restauracao({"quem": "e2e", "verificado": True})
+    r = estado.carregar(base.pasta)
+    assert r.passos["suite:main"]["status"] == "em_andamento"
+    assert r.passos["noturno:julgamento-revisao"]["status"] == "falhou"
+    assert [x["quem"] for x in r.restauracoes] == ["suite", "e2e"]
+
+
+def test_escritas_concorrentes_em_threads_nao_perdem_passos(tmp_path):
+    import threading
+    base = estado.nova_sprint(tmp_path)
+
+    def marcar(prefixo):
+        e = estado.carregar(base.pasta)
+        for i in range(25):
+            e.concluir(f"{prefixo}:{i}")
+
+    ts = [threading.Thread(target=marcar, args=(p,)) for p in ("a", "b", "c")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    r = estado.carregar(base.pasta)
+    assert sum(1 for k in r.passos if r.feito(k)) == 75
+
+
+def test_trava_ocupada_por_muito_tempo_levanta(tmp_path, monkeypatch):
+    import msvcrt
+    base = estado.nova_sprint(tmp_path)
+    monkeypatch.setattr(estado, "ESPERA_TRAVA", 0.3)
+    with open(base.pasta / "estado.lock", "a+b") as f:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            with __import__("pytest").raises(TimeoutError):
+                base.concluir("x")
+        finally:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)

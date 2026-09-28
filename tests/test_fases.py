@@ -189,6 +189,65 @@ def test_catalogo_validar_ok_quando_tudo_presente(tmp_path, monkeypatch, capsys)
     saida = json.loads(capsys.readouterr().out)
     assert saida == {"itens": 5, "principios": 1, "erros": []}
 
+def test_catalogo_publicar_sem_rascunho_recusa(tmp_path, monkeypatch, capsys):
+    from maw_agent import config
+    monkeypatch.setattr(config, "CATALOGO", tmp_path / "f.yaml")
+    from maw_agent.cli import main
+    assert main(["catalogo", "publicar"]) == 1
+    assert "rascunho" in capsys.readouterr().out
+
+def test_catalogo_publicar_recusa_yaml_com_erro_de_sintaxe_e_preserva_atual(tmp_path, monkeypatch, capsys):
+    from maw_agent import config
+    cat = tmp_path / "f.yaml"
+    original = "conteudo: preservado\n"
+    cat.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(config, "CATALOGO", cat)
+    monkeypatch.setattr(config, "PRINCIPIOS", tmp_path / "nao.yaml")
+    monkeypatch.setattr(fases.catalogo.time, "sleep", lambda s: None)  # não esperar de verdade no teste
+    rascunho = tmp_path / "rascunho.yaml"
+    rascunho.write_text(":\n  - quebrado [", encoding="utf-8")
+    from maw_agent.cli import main
+    assert main(["catalogo", "publicar", str(rascunho)]) == 1
+    assert cat.read_text(encoding="utf-8") == original
+
+def test_catalogo_publicar_recusa_catalogo_estruturalmente_invalido_e_preserva_atual(tmp_path, monkeypatch, capsys):
+    import yaml
+    from maw_agent import config
+    cat = tmp_path / "f.yaml"
+    original = yaml.safe_dump([{"id": "a/b", "area": "a", "titulo": "t", "descricao": "d", "origem": ["x"],
+                                "verificacao": ["e2e"], "cenarios": [], "requisitos": [], "marco": "M2"}])
+    cat.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(config, "CATALOGO", cat)
+    monkeypatch.setattr(config, "PRINCIPIOS", tmp_path / "nao.yaml")
+    rascunho = tmp_path / "rascunho.yaml"
+    rascunho.write_text(yaml.safe_dump([{"id": "a/dup"}, {"id": "a/dup"}]), encoding="utf-8")
+    from maw_agent.cli import main
+    assert main(["catalogo", "publicar", str(rascunho)]) == 1
+    saida = capsys.readouterr().out
+    assert "duplicado" in saida
+    assert cat.read_text(encoding="utf-8") == original
+
+def test_catalogo_publicar_troca_o_catalogo_atomicamente_quando_valido(tmp_path, monkeypatch, capsys):
+    import yaml
+    from maw_agent import config
+    cat = tmp_path / "f.yaml"
+    cat.write_text("conteudo: antigo\n", encoding="utf-8")
+    princ = tmp_path / "p.yaml"
+    princ.write_text(yaml.safe_dump([{"id": "P1", "titulo": "t"}]), encoding="utf-8")
+    monkeypatch.setattr(config, "CATALOGO", cat)
+    monkeypatch.setattr(config, "PRINCIPIOS", princ)
+    obrigatorios = ["saude/build-release", "saude/build-debug", "saude/suite-existente", "saude/benchmark",
+                    "principio/P1"]
+    itens = [{"id": i, "area": "a", "titulo": "t", "descricao": "d", "origem": ["x"], "verificacao": ["e2e"],
+             "cenarios": [], "requisitos": [], "marco": "M2"} for i in obrigatorios]
+    rascunho = tmp_path / "rascunho.yaml"
+    rascunho.write_text(yaml.safe_dump(itens, allow_unicode=True), encoding="utf-8")
+    from maw_agent.cli import main
+    assert main(["catalogo", "publicar", str(rascunho)]) == 0
+    saida = json.loads(capsys.readouterr().out)
+    assert saida["ok"] is True and saida["itens"] == 5
+    assert yaml.safe_load(cat.read_text(encoding="utf-8")) == itens
+
 def test_juntar_reverificacoes_sem_arquivos(tmp_path):
     assert fases.juntar_reverificacoes(tmp_path) == ({}, [])
 
@@ -443,9 +502,167 @@ def test_achado_mecanico_de_build_ou_suite_nao_depende_de_veredito(tmp_path):
     assert any("build-main-Release.json" in m for m in msgs)  # o veredito ilegível continua declarado
 
 
+def test_ler_brutos_veredito_confirmado_promove_confianca(tmp_path):
+    bruto = dict(fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"],
+                                              "log": "l.log"}), fonte="testador-motor", confianca="provavel")
+    _gravar(tmp_path, "achados-brutos/promove.json", bruto)
+    _gravar(tmp_path, "vereditos/promove.json", {"resultado": "confirmado", "justificativa": "reproduzi"})
+    entradas, _, _ = fases.ler_brutos(tmp_path)
+    por_origem = {o: a for o, a in entradas}
+    assert por_origem["promove.json[0]"]["confianca"] == "confirmado"
+
+
+def test_ler_brutos_veredito_provavel_rebaixa_confianca(tmp_path):
+    bruto = dict(fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"],
+                                              "log": "l.log"}), fonte="testador-motor", confianca="confirmado")
+    _gravar(tmp_path, "achados-brutos/rebaixa.json", bruto)
+    _gravar(tmp_path, "vereditos/rebaixa.json", {"resultado": "provavel", "justificativa": "não reproduzi bem"})
+    entradas, _, _ = fases.ler_brutos(tmp_path)
+    por_origem = {o: a for o, a in entradas}
+    assert por_origem["rebaixa.json[0]"]["confianca"] == "provavel"
+
+
 def test_conferir_referencias_recusa_fonte_mecanica():
     a = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
     for fonte in ("build", "suite"):
         erros = fases.conferir_referencias([dict(a, fonte=fonte)], {"saude/build-release"}, {"main": "a" * 40})
         assert len(erros) == 1 and f"'{fonte}'" in erros[0] and "reservada" in erros[0]
     assert fases.conferir_referencias([dict(a, fonte="suite")], None, None)[0].startswith("achado 0: fonte")
+
+
+def test_saida_com_stdout_cp1252_redirecionado_nao_quebra(monkeypatch):
+    import io
+    import sys
+    bruto = io.BytesIO()
+    saida = io.TextIOWrapper(bruto, encoding="cp1252", newline="\n")
+    monkeypatch.setattr(sys, "stdout", saida)
+    obj = {"bloco": "SONDA Andamento → clipe dividido", "ok": "✓", "acento": "ação"}
+    assert fases._saida(obj, False) == 1
+    saida.flush()
+    texto = bruto.getvalue().decode("cp1252")
+    assert json.loads(texto) == obj  # o mesmo JSON, sem perder nada (escapes \uXXXX onde o cp1252 não tem)
+
+
+# ---------- sondas do agente na suíte e no build ----------
+
+MAPA_SONDAS = {"SONDA Andamento": ["ia/andamento"], "SONDA Audio": ["ia/audio", "principio/P4"],
+               "SONDA Alocacao": ["principio/P2", "efeitos/sem-alocacao"]}
+
+
+def test_itens_com_sondas_junta_o_mapa_sem_duplicar_nem_mexer_no_original():
+    itens = [{"id": "ia/andamento", "cenarios": ["suite:Deteccao de andamento", "suite:SONDA Andamento"]},
+             {"id": "ia/audio", "cenarios": []}, {"id": "outro/x", "cenarios": ["suite:Bloco A"]}]
+    novos = fases.itens_com_sondas(itens, MAPA_SONDAS)
+    por_id = {i["id"]: i for i in novos}
+    assert por_id["ia/andamento"]["cenarios"] == ["suite:Deteccao de andamento", "suite:SONDA Andamento"]
+    assert por_id["ia/audio"]["cenarios"] == ["suite:SONDA Audio"]
+    assert por_id["outro/x"]["cenarios"] == ["suite:Bloco A"]
+    assert itens[1]["cenarios"] == []  # o catálogo carregado não muda
+
+
+def test_resultados_suite_por_item_sonda_citada_cobre_a_verificacao_sonda():
+    itens = [{"id": "a/com-sonda", "verificacao": ["suite", "sonda"], "marco": "M5",
+              "cenarios": ["suite:Bloco A", "suite:SONDA Andamento"]},
+             {"id": "a/sem-sonda", "verificacao": ["suite", "sonda"], "marco": "M5", "cenarios": ["suite:Bloco A"]}]
+    blocos = [{"nome": "Bloco A", "sub": "x", "ok": 1, "falhas": 0},
+              {"nome": "SONDA Andamento", "sub": "y", "ok": 2, "falhas": 0}]
+    r = fases.resultados_suite_por_item(itens, blocos, ("suite",))
+    assert r["a/com-sonda"] == ("passou", None)
+    assert r["a/sem-sonda"][0] == "nao_testavel" and "sonda" in r["a/sem-sonda"][1]
+
+
+def test_resultados_suite_por_item_diz_por_que_a_sonda_nao_rodou():
+    itens = [{"id": "a/x", "verificacao": ["suite", "sonda"], "marco": "M5",
+              "cenarios": ["suite:Bloco A", "suite:SONDA Andamento", "suite:Sumido"]}]
+    blocos = [{"nome": "Bloco A", "sub": "x", "ok": 1, "falhas": 0}]
+    r = fases.resultados_suite_por_item(itens, blocos, ("suite",),
+                                        {"SONDA Andamento": "sonda não compila em main: SondaA.cpp(3): error C2065: x"})
+    res, motivo = r["a/x"]
+    assert res == "nao_testavel"
+    assert "SONDA Andamento: sonda não compila em main" in motivo and "bloco da suíte não encontrado: Sumido" in motivo
+
+
+def test_achados_das_sondas_so_para_bloco_que_falha_com_o_detalhe_dele():
+    blocos = [{"nome": "SONDA Andamento", "sub": "clipe dividido", "ok": 3, "falhas": 2},
+              {"nome": "SONDA Andamento", "sub": "120 BPM", "ok": 4, "falhas": 0},
+              {"nome": "SONDA Alocacao", "sub": "efeitos", "ok": 1, "falhas": 1},
+              {"nome": "SONDA Nova", "sub": "z", "ok": 0, "falhas": 1}]
+    detalhes = ["- Bloco A / x", "!!! falha da MAW", "- SONDA Andamento / clipe dividido",
+                "!!! Test 1 failed: a metade da direita tem 140 BPM e T mediu 115.58 BPM",
+                "- SONDA Alocacao / efeitos", "!!! Test 1 failed: 3 alocacoes"]
+    lista = fases.achados_das_sondas(ALVO, blocos, detalhes, MAPA_SONDAS, {"SONDA Andamento": "SondaA.cpp"})
+    assert all(achados.validar(a) == [] for a in lista)
+    assert len(lista) == 3
+    a, b, c = lista
+    # a sonda é teste do próprio agente: não é fonte mecânica, passa pela verificação adversarial
+    assert a["fonte"] == "sonda" and a["assinatura"] == "suite:SONDA Andamento|clipe dividido"
+    assert "sonda" not in fases.FONTES_MECANICAS
+    assert a["causa_provavel"]["arquivo_linha"] == "privado/sondas/SondaA.cpp"
+    assert "teste do próprio agente" in a["causa_provavel"]["texto"]
+    assert b["causa_provavel"]["arquivo_linha"].startswith("privado/sondas/")  # sem arquivo conhecido
+    assert a["item_catalogo"] == "ia/andamento" and a["principio"] is None
+    assert "115.58" in a["obtido"] and "falha da MAW" not in a["obtido"] and "3 alocacoes" not in a["obtido"]
+    assert any("SondaA.cpp" in p for p in a["passos"]) and a["evidencias"][0]["arquivo"] == "suites/main.json"
+    assert "sonda" in a["titulo"].lower()
+    # item de funcionalidade primeiro; o princípio vai para `principio`
+    assert b["item_catalogo"] == "efeitos/sem-alocacao" and b["principio"] == "P2" and b["severidade"] == "alta"
+    assert a["severidade"] == "media"
+    # sonda fora do mapa: item genérico de saúde, nunca a suíte existente da MAW
+    assert c["item_catalogo"] == "saude/geral"
+
+
+def test_sondas_nos_erros_do_msbuild():
+    injetadas = ["SondaA.cpp", "SondaB.cpp"]
+    wt = r"C:\x\work\alvos\main\Source"
+    assert fases.sondas_nos_erros([wt + r"\Tests\Sondas\SondaA.cpp(12,5): error C2039: 'x': is not a member"],
+                                  injetadas) == {"SondaA.cpp"}
+    assert fases.sondas_nos_erros(["SondaB.obj : error LNK2019: unresolved external symbol f"], injetadas) \
+        == {"SondaB.cpp"}
+    assert fases.sondas_nos_erros([wt + r"\Audio\Motor.cpp(3): error C2065: 'y': undeclared identifier",
+                                   "LINK : fatal error LNK1120: 1 unresolved externals"], injetadas) == set()
+    # na pasta das sondas, mas sem nome reconhecível: todas são suspeitas
+    assert fases.sondas_nos_erros([wt + r"/Tests/Sondas/Outra.cpp(1): error C1083: cannot open"], injetadas) \
+        == {"SondaA.cpp", "SondaB.cpp"}
+    assert fases.sondas_nos_erros(["qualquer coisa"], []) == set()
+
+
+def test_reverificacao_automatica_de_achado_de_sonda(tmp_path):
+    ultimo = fases.achados_das_sondas(ALVO, [{"nome": "SONDA Andamento", "sub": "s", "ok": 0, "falhas": 1}], [],
+                                      MAPA_SONDAS)[0]
+    hist = {"itens": {"k": {"id": "MAW-0009", "estado": "aberto", "ultimo": ultimo}}}
+    alvos_sprint = [{"nome": "main", "commit": "a" * 40, "compartilha_com": None}]
+    suites = tmp_path / "suites"
+    suites.mkdir()
+    base = {"blocos": [{"nome": "Bloco A", "sub": "x", "ok": 1, "falhas": 0}], "incoerencias": [], "assercoes": []}
+    (suites / "main.json").write_text(json.dumps({**base, "sondas": {"blocos": [
+        {"nome": "SONDA Andamento", "sub": "s", "ok": 1, "falhas": 0}]}}), encoding="utf-8")
+    assert fases.reverificacoes_automaticas(hist, alvos_sprint, tmp_path) == {"MAW-0009": "corrigido"}
+    (suites / "main.json").write_text(json.dumps({**base, "sondas": {"blocos": [
+        {"nome": "SONDA Andamento", "sub": "s", "ok": 0, "falhas": 1}]}}), encoding="utf-8")
+    assert fases.reverificacoes_automaticas(hist, alvos_sprint, tmp_path) == {"MAW-0009": "persiste"}
+    (suites / "main.json").write_text(json.dumps(base), encoding="utf-8")  # a sonda não rodou
+    assert fases.reverificacoes_automaticas(hist, alvos_sprint, tmp_path) == {"MAW-0009": "nao_verificavel"}
+
+
+def test_achado_de_sonda_sem_veredito_vira_provavel_e_com_veredito_confirmado(tmp_path):
+    [a] = fases.achados_das_sondas(ALVO, [{"nome": "SONDA Andamento", "sub": "s", "ok": 0, "falhas": 1}], [],
+                                   MAPA_SONDAS, {"SONDA Andamento": "SondaA.cpp"})
+    brutos = tmp_path / "achados-brutos"
+    brutos.mkdir()
+    (brutos / "sonda-main-000.json").write_text(json.dumps(a), encoding="utf-8")
+    (brutos / "sonda-main-001.json").write_text(json.dumps(dict(a, assinatura="suite:SONDA X|y")), encoding="utf-8")
+    (tmp_path / "vereditos").mkdir()
+    (tmp_path / "vereditos" / "sonda-main-001.json").write_text(json.dumps({"resultado": "confirmado"}),
+                                                                encoding="utf-8")
+    entradas, sem_verificacao, _ = fases.ler_brutos(tmp_path)
+    por_nome = {o.split("[")[0]: x for o, x in entradas}
+    assert por_nome["sonda-main-000.json"]["confianca"] == "provavel"
+    assert id(por_nome["sonda-main-000.json"]) in sem_verificacao
+    assert por_nome["sonda-main-001.json"]["confianca"] == "confirmado"
+
+
+def test_fonte_sonda_e_reservada_a_cli():
+    a = dict(fases.achados_das_sondas(ALVO, [{"nome": "SONDA Andamento", "sub": "s", "ok": 0, "falhas": 1}], [],
+                                      MAPA_SONDAS)[0])
+    erros = fases.conferir_referencias([a], None, {"main": "a" * 40})
+    assert any("sonda" in e and "reservada" in e for e in erros)

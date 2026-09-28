@@ -1,13 +1,13 @@
 {# maw_agent/relatorio/modelos/relatorio.html.j2 #}
 <!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><title>MAW — {{ sprint }}</title>
-<style>{{ css }}</style></head>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>{{ titulo }}</title>
+<style>{{ css | safe }}</style>{# o CSS é o arquivo do próprio agente; o resto continua escapado #}</head>
 <body>
 
 <section class="capa">
   {% if logo_data_uri %}<img class="logo" src="{{ logo_data_uri }}" alt="MAW">{% else %}<div class="logo-texto">MAW</div>{% endif %}
-  <h1>Relatório de testes</h1>
-  <p class="sub">{{ sprint }} · {{ data }} · duração {{ duracao }}</p>
+  <h1>{{ titulo }}</h1>
+  <p class="sub"><b>{{ subtitulo }}</b> · {{ sprint }} · {{ data }} · duração {{ duracao }}</p>
   <table class="alvos-capa">
     <tr><th>Alvo</th><th>Branch</th><th>Commit</th><th>Origem</th><th>Situação</th></tr>
     {% for a in alvos %}<tr><td>{{ a.nome }}</td><td>{{ a.branch }}</td><td class="mono">{{ a.commit[:10] }}</td>
@@ -87,6 +87,7 @@
     {% if a.causa_provavel %}<h4>Causa provável (hipótese)</h4><p><span class="mono">{{ a.causa_provavel.arquivo_linha }}</span> — {{ a.causa_provavel.texto }}</p>{% endif %}
     <h4>Sugestão</h4><p>{{ a.sugestao }}</p>
     <h4>Critério de aceite</h4><p>{{ a.criterio_aceite }}</p>
+    {% if a.nota_verificacao %}<h4>Nota da verificação</h4><p>{{ a.nota_verificacao }}</p>{% endif %}
     {% for ev in a.evidencias if ev.embutir and ev.data_uri %}<figure><img src="{{ ev.data_uri }}"><figcaption>{{ ev.legenda }}</figcaption></figure>{% endfor %}
   </article>
   {% else %}<p>Nenhum achado.</p>{% endfor %}
@@ -97,7 +98,8 @@
   {% for a in melhorias %}
   <article class="ficha melhoria"><h3>{{ a.id }} · {{ a.titulo }}</h3>
     <p class="meta">prioridade {{ a.prioridade }}{% if a.principio %} · serve ao princípio {{ a.principio }}{% endif %}</p>
-    <p>{{ a.obtido }}</p><h4>Proposta</h4><p>{{ a.sugestao }}</p><h4>Critério de aceite</h4><p>{{ a.criterio_aceite }}</p></article>
+    <p>{{ a.obtido }}</p><h4>Proposta</h4><p>{{ a.sugestao }}</p><h4>Critério de aceite</h4><p>{{ a.criterio_aceite }}</p>
+    {% if a.nota_verificacao %}<h4>Nota da verificação</h4><p>{{ a.nota_verificacao }}</p>{% endif %}</article>
   {% else %}<p>Nenhuma melhoria proposta.</p>{% endfor %}
 </section>
 
@@ -115,13 +117,45 @@
   {% for a in alvos %}<tr><td>{{ a.nome }}</td>
     <td>{% if a.build %}{{ 'ok' if a.build.ok else 'FALHOU' }} · {{ a.build.segundos }} s · {{ a.build.avisos | length }} avisos{% else %}não registrado{% endif %}</td>
     <td>{% if a.build_debug %}{{ 'ok' if a.build_debug.ok else 'FALHOU' }} · {{ a.build_debug.segundos }} s{% else %}não registrado{% endif %}</td>
-    <td>{% if a.suite %}{{ a.suite.total_ok }} ok / {{ a.suite.total_falhas }} falhas em {{ a.suite.blocos | length }} blocos{% if a.suite.assercoes %} · {{ a.suite.assercoes | length }} jassert{% endif %}{% else %}não registrada{% endif %}</td>
+    <td>{% if a.suite %}{{ a.suite.total_ok }} ok / {{ a.suite.total_falhas }} falhas em {{ a.suite.blocos | length }} blocos{% if a.suite.assercoes %} · {{ a.suite.assercoes | length }} jassert{% endif %}{% if a.suite.sondas %}<br><small>sondas do agente: {{ a.suite.sondas.total_ok }} ok / {{ a.suite.sondas.total_falhas }} falhas em {{ a.suite.sondas.blocos | length }} blocos</small>{% endif %}{% else %}não registrada{% endif %}</td>
     <td>{% if a.benchmark and a.benchmark.linhas %}{{ a.benchmark.linhas[-1].carga_max }} %{% else %}não registrado{% endif %}</td></tr>{% endfor %}
   </table>
+  <p class="legenda">A suíte conta só os blocos da própria MAW; os blocos das sondas do agente (testes que o agente injeta no build Debug) aparecem à parte e nunca contam contra a suíte existente.</p>
+</section>
+
+<section>
+  <h2>9. Bancada do usuário</h2>
+  {% for l in bancada.linhas %}<p>{{ l }}</p>{% endfor %}
+  {% if bancada.secoes %}
+  <p>{{ bancada.total }} teste(s) da bancada: {{ bancada.contagens['passou'] }} passou · {{ bancada.contagens['problema'] }} problema · {{ bancada.contagens['pulei'] }} pulei · {{ bancada.contagens['sem resultado'] }} sem resultado.</p>
+  {% for s in bancada.secoes %}
+  <h3>{{ s.titulo }} <small class="legenda">({{ s.contagens['passou'] }} passou · {{ s.contagens['problema'] }} problema · {{ s.contagens['pulei'] }} pulei · {{ s.contagens['sem resultado'] }} sem resultado)</small></h3>
+  <table class="grade bancada"><tr><th>Código</th><th>Teste</th><th>Estado</th><th>Nota do agente</th></tr>
+  {% for t in s.testes %}<tr><td class="mono">{{ t.codigo }}</td><td>{{ t.titulo }}</td><td class="estado {{ t.classe }}">{{ t.estado }}</td><td>{{ t.nota }}{% if t.alvo and t.alvo != 'main' %} <small>(alvo {{ t.alvo }})</small>{% endif %}</td></tr>{% endfor %}
+  </table>
+  {% endfor %}
+  {% endif %}
+</section>
+
+<section>
+  <h2>10. Calibração</h2>
+  {% if calibracao.rodou %}
+  <p><b>Taxa de detecção:</b> {{ calibracao.texto_taxa }}.</p>
+  <p class="legenda">Defeitos conhecidos são reinjetados um de cada vez numa cópia do main e a suíte (com as sondas do agente) roda de novo; só conta o que falha a mais que na mesma árvore sem defeito.</p>
+  {% for l in calibracao.linhas %}<p>{{ l }}</p>{% endfor %}
+  {% if calibracao.defeitos %}
+  <table class="grade"><tr><th>Defeito</th><th>Origem</th><th>Resultado</th><th>Quem pegou</th></tr>
+  {% for d in calibracao.defeitos %}<tr><td class="mono">{{ d.id }}</td><td>{{ d.origem or '—' }}</td><td class="estado {{ d.classe }}">{{ d.situacao }}</td>
+    <td>{% if d.erro %}{{ d.erro }}{% elif d.blocos %}{{ d.blocos | join('; ') }}{% else %}nenhum bloco falhou a mais que no controle{% endif %}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+  {% else %}
+  {% for l in calibracao.linhas %}<p>{{ l }}</p>{% endfor %}
+  {% endif %}
 </section>
 
 <section class="paisagem">
-  <h2>9. Matriz de cobertura</h2>
+  <h2>11. Matriz de cobertura</h2>
   <p class="legenda">✓ passou · ✗ falhou · – não testável (motivo nas limitações) · n/a não se aplica</p>
   <table class="matriz"><thead><tr><th>Item</th>{% for n in matriz.alvos %}<th>{{ n }}</th>{% endfor %}</tr></thead>
   <tbody>{% for l in matriz.linhas %}<tr><td><span class="mono">{{ l.item }}</span> {{ l.titulo }}</td>
@@ -129,7 +163,7 @@
 </section>
 
 <section>
-  <h2>10. Limitações desta sprint</h2>
+  <h2>12. Limitações desta sprint</h2>
   <ul>{% for l in limitacoes %}<li>{{ l }}</li>{% else %}<li>Nenhuma.</li>{% endfor %}</ul>
   <h3>Achados derrubados na verificação ({{ derrubados | length }})</h3>
   <ul>{% for d in derrubados %}<li>{{ d.titulo }} — {{ d.justificativa }}</li>{% else %}<li>Nenhum.</li>{% endfor %}</ul>
@@ -138,7 +172,7 @@
 </section>
 
 <section>
-  <h2>11. Ambiente e método</h2>
+  <h2>13. Ambiente e método</h2>
   <table class="grade">{% for k, v in ambiente.items() %}<tr><td>{{ k }}</td><td>{{ v if v is string else (v | join(', ') if v is iterable else v) }}</td></tr>{% endfor %}</table>
   <h3>Pré-voo</h3>
   <ul>{% for v in preflight %}<li>{{ '✓' if v.ok else '✗' }} {{ v.nome }} — {{ v.detalhe }}</li>{% endfor %}</ul>

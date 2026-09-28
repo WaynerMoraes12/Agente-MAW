@@ -1,6 +1,7 @@
 """Catálogo de funcionalidades, resultados por célula e a matriz de cobertura."""
 from __future__ import annotations
 import json
+import time
 from pathlib import Path
 
 import yaml
@@ -10,10 +11,24 @@ from . import sandbox
 VERIFICACOES = ("e2e", "sonda", "servico", "revisao", "suite", "benchmark")
 RESULTADOS = ("passou", "falhou", "nao_testavel", "na")
 _OBRIGATORIOS = ("id", "area", "titulo", "descricao", "origem", "verificacao", "cenarios", "requisitos", "marco")
+_TENTATIVAS_YAML = 5
+_ESPERA_YAML = 0.3
 
 
 def carregar(caminho: Path) -> list[dict]:
-    return yaml.safe_load(Path(caminho).read_text(encoding="utf-8")) or []
+    """Lê e faz parse do YAML; em `yaml.YAMLError` tenta de novo (até 5 vezes, 0,3s entre
+    elas) antes de levantar — cobre o instante em que outro processo está regravando o
+    arquivo (ex.: `catalogo publicar` de outra sprint)."""
+    caminho = Path(caminho)
+    ultimo_erro: yaml.YAMLError | None = None
+    for tentativa in range(_TENTATIVAS_YAML):
+        try:
+            return yaml.safe_load(caminho.read_text(encoding="utf-8")) or []
+        except yaml.YAMLError as ex:
+            ultimo_erro = ex
+            if tentativa < _TENTATIVAS_YAML - 1:
+                time.sleep(_ESPERA_YAML)
+    raise ultimo_erro
 
 
 def validar(itens: list[dict]) -> list[str]:

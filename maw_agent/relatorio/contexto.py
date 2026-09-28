@@ -7,7 +7,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from .. import catalogo
+from .. import calibracao, catalogo, config
 from ..estado import FASES, FINAL
 
 ABERTOS = ("novo", "aberto", "regressao", "nao_verificavel")
@@ -115,9 +115,131 @@ def _metodo(estado: dict) -> list[str]:
     return out
 
 
+ESTADOS_BANCADA = ("passou", "problema", "pulei", "sem resultado")
+
+
+def _ler_objeto(p: Path, erros_agente: list[str], rotulo: str) -> dict | None:
+    """JSON que tem de ser um objeto; ausente → None; ilegível → None e uma linha nos erros do agente."""
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("não é um objeto JSON")
+        return d
+    except (OSError, ValueError) as ex:
+        erros_agente.append(f"{rotulo} ilegível: {ex}")
+        return None
+
+
+def _bancada(pasta: Path, pasta_bancada: Path, erros_agente: list[str]) -> dict:
+    """Cada teste da bancada do usuário (`work/bancada/testes/<código>.json`) com o estado do agente
+    nesta sprint (`bancada.json`: passou/problema/pulei; ausente = "sem resultado") e a nota, por seção
+    (ordem e títulos de `meta/secoes.json`), com contagens. O que faltar vira uma linha, nunca uma
+    seção vazia."""
+    testes_dir = pasta_bancada / "testes"
+    testes: list[dict] = []
+    for arq in sorted(testes_dir.glob("*.json")) if testes_dir.is_dir() else []:
+        d = _ler_objeto(arq, erros_agente, f"teste da bancada {arq.name}")
+        if d is None:
+            continue
+        ordem = d.get("ordem") if isinstance(d.get("ordem"), int) else 10 ** 6
+        testes.append({"codigo": arq.stem, "titulo": str(d.get("titulo") or arq.stem),
+                       "secao": str(d.get("secao") or "sem seção"), "ordem": ordem})
+    linhas: list[str] = []
+    resultados = _ler_objeto(pasta / "bancada.json", erros_agente, "bancada.json")
+    if not testes:
+        linhas.append("A bancada não pôde ser listada: a lista de testes (work/bancada/testes) não foi encontrada "
+                      "ou está vazia.")
+    if resultados is None:
+        linhas.append("A bancada não rodou nesta sprint: nenhum resultado do agente (bancada.json ausente ou "
+                      "ilegível); todos os testes ficam sem resultado.")
+    resultados = resultados or {}
+    meta = _ler_objeto(pasta_bancada / "meta" / "secoes.json", erros_agente, "meta/secoes.json da bancada") or {}
+    titulos: dict[str, str] = {}
+    for s in meta.get("lista") or []:
+        if isinstance(s, dict) and s.get("id"):
+            titulos.setdefault(str(s["id"]), str(s.get("titulo") or s["id"]))
+    ordem_secoes = list(titulos) + sorted({t["secao"] for t in testes} - set(titulos))
+    vazio = {e: 0 for e in ESTADOS_BANCADA}
+    total = dict(vazio)
+    secoes = []
+    for sid in ordem_secoes:
+        doid = sorted((t for t in testes if t["secao"] == sid), key=lambda t: (t["ordem"], t["codigo"]))
+        if not doid:
+            continue
+        cont = dict(vazio)
+        linhas_secao = []
+        for t in doid:
+            r = resultados.get(t["codigo"])
+            r = r if isinstance(r, dict) else {}
+            estado = r.get("estado") if r.get("estado") in ESTADOS_BANCADA[:3] else "sem resultado"
+            if r and estado == "sem resultado":
+                erros_agente.append(f"bancada.json: estado inválido para {t['codigo']}: {r.get('estado')!r}")
+            cont[estado] += 1
+            total[estado] += 1
+            linhas_secao.append({"codigo": t["codigo"], "titulo": t["titulo"], "estado": estado,
+                                 "classe": estado.replace(" ", "_"), "nota": str(r.get("nota") or ""),
+                                 "alvo": str(r.get("alvo") or "")})
+        secoes.append({"id": sid, "titulo": titulos.get(sid, sid), "testes": linhas_secao, "contagens": cont})
+    fora = sorted(set(resultados) - {t["codigo"] for t in testes})
+    if fora and testes:
+        linhas.append(f"Resultados do agente para código(s) fora da lista da bancada: {', '.join(fora)}.")
+    return {"secoes": secoes, "contagens": total, "total": len(testes), "linhas": linhas}
+
+
+def _calibracao(pasta: Path, passos: dict, erros_agente: list[str]) -> dict:
+    """Taxa de detecção da calibração desta sprint (`calibracao.json`) e, para cada defeito
+    reinjetado, se foi detectado e por quais blocos. Sem calibração: uma linha dizendo que não rodou."""
+    passo = passos.get("calibrar") or {}
+    vazio = {"rodou": False, "linhas": [], "defeitos": [], "taxa": None, "texto_taxa": ""}
+    p = pasta / "calibracao.json"
+    if not p.exists():
+        linha = "A calibração não rodou nesta sprint (calibracao.json ausente)."
+        if passo.get("status") == "falhou":
+            linha += f" O passo calibrar falhou: {passo.get('erro') or 'sem mensagem de erro'}."
+        return {**vazio, "linhas": [linha]}
+    res = _ler_objeto(p, erros_agente, "calibracao.json")
+    if res is not None and not all(isinstance(r, dict) for r in res.values()):
+        erros_agente.append("calibracao.json ilegível: algum defeito não é um objeto JSON")
+        res = None
+    if res is None:
+        return {**vazio, "linhas": ["A calibração não rodou até o fim: calibracao.json está ilegível (ver os erros "
+                                    "do agente)."]}
+    t = calibracao.taxa(res)
+    if t["validos"]:
+        texto = f"{t['detectados']} de {t['validos']} defeito(s) reinjetado(s) detectado(s) ({t['taxa'] * 100:.0f}%)"
+    else:
+        texto = "nenhum defeito medido com validade: sem taxa"
+    if t["erros"]:
+        texto += f"; {t['erros']} defeito(s) fora da taxa por erro da calibração"
+    defeitos = []
+    for id_, r in res.items():
+        situacao = "erro" if r.get("erro") else ("detectado" if r.get("detectado") else "não detectado")
+        defeitos.append({"id": id_, "origem": str(r.get("origem") or ""), "situacao": situacao,
+                         "classe": {"não detectado": "nao_detectado"}.get(situacao, situacao),
+                         "blocos": [str(b) for b in r.get("blocos_que_falharam") or []]
+                                   + [f"incoerência: {i}" for i in r.get("incoerencias") or []],
+                         "erro": r.get("erro"), "como_esperado": r.get("como_esperado")})
+    linhas = []
+    if passo.get("status") != "concluido":
+        linhas.append("Resultado parcial: o passo calibrar não terminou nesta sprint.")
+    if not res:
+        linhas.append("calibracao.json não tem nenhum defeito medido.")
+    controle = (passo.get("detalhe") or {}).get("controle") or {}
+    if controle.get("erro"):
+        linhas.append(f"Controle (a mesma árvore sem defeito) inválido: {controle['erro']}.")
+    if controle.get("blocos_que_falharam"):
+        linhas.append(f"Controle (a mesma árvore sem defeito): {len(controle['blocos_que_falharam'])} bloco(s) já "
+                      f"falhavam e foram descontados: {'; '.join(controle['blocos_que_falharam'])}.")
+    return {"rodou": True, "linhas": linhas, "defeitos": defeitos, "taxa": t, "texto_taxa": texto}
+
+
 def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Path | None,
-           logo: Path | None) -> dict:
+           logo: Path | None, pasta_bancada: Path | None = None) -> dict:
+    """`pasta_bancada`: a pasta da bancada do usuário (padrão `work/bancada`)."""
     pasta = Path(pasta)
+    pasta_bancada = Path(pasta_bancada) if pasta_bancada is not None else config.WORK / "bancada"
     estado = _ler(pasta / "estado.json", {"numero": 0, "passos": {}})
     passos = estado.get("passos", {})
     alvos_info = _ler(pasta / "alvos.json", {"alvos": [], "avisos": []})
@@ -128,6 +250,10 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
             if ev.get("embutir") and arq.suffix.lower() in (".png", ".jpg", ".jpeg") and arq.exists():
                 tipo = "png" if arq.suffix.lower() == ".png" else "jpeg"
                 ev["data_uri"] = f"data:image/{tipo};base64," + base64.b64encode(arq.read_bytes()).decode()
+        # "Nota da verificação" na ficha: a justificativa de quem julgou (confirmado ou provável),
+        # até 700 caracteres. Sem veredito legível (mecânico ou não revisado), não há nota.
+        justificativa = (a.get("veredito") or {}).get("justificativa")
+        a["nota_verificacao"] = justificativa[:700] if justificativa else None
     intocada = _ler(pasta / "intocada.json", {"verificado": False, "diferencas": ["prova não registrada"],
                                               "ambiente_restaurado": False})
     textos = _ler(pasta / "textos.json", {})
@@ -220,6 +346,9 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         logo_uri = "data:image/png;base64," + base64.b64encode(Path(logo).read_bytes()).decode()
     return {
         "sprint": f"sprint-{estado['numero']:02d}",
+        # o agente se chama Roadie; o arquivo do PDF e os nomes do pacote/CLI continuam os mesmos
+        "titulo": f"Roadie — relatório da Sprint {estado['numero']:02d}",
+        "subtitulo": "agente de testes da MAW",
         "data": estado.get("criado", "")[:10],
         "duracao": _duracao(estado),
         "alvos": alvos,
@@ -250,4 +379,6 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         "preflight": _ler(pasta / "preflight.json", []),
         "anterior": anterior.name if anterior else None,
         "logo_data_uri": logo_uri,
+        "bancada": _bancada(pasta, pasta_bancada, erros_agente),
+        "calibracao": _calibracao(pasta, passos, erros_agente),
     }

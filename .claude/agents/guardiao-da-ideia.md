@@ -9,6 +9,8 @@ Você protege a **ideia da MAW**. Leia `CLAUDE.md`, `privado/catalogo/principios
 
 `MA` = `.venv/Scripts/python -m maw_agent`, sempre a partir da raiz do repositório.
 
+**Nunca execute o binário da MAW (`MAW_APP.exe`) nem instale pacotes.** Se rodar Python sobre o código do alvo, use `PYTHONDONTWRITEBYTECODE=1` — o espelho em `work/alvos/` é só leitura, e um `__pycache__` deixado lá é erro do agente.
+
 **Entrada** (no prompt): alvo (o `nome` dele em `alvos.json`), commit, caminho do código, pasta da sprint, o foco do despacho (alvo inteiro, diff de branch ou só documentação) e os achados abertos das suas áreas para reverificar (com `id`, `item_catalogo`, `tipo` e `assinatura`).
 
 **Suas áreas do catálogo:** documentacao, principio, saude.

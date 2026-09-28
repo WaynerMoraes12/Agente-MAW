@@ -5,13 +5,46 @@ import subprocess
 from pathlib import Path
 from maw_agent import preflight
 
-NOMES = {"maw_fechada", "msbuild", "edge", "disco", "vb_cable", "python310", "ffmpeg",
-         "midi_loopback", "nao_perturbe", "tela"}
+NOMES = {"maw_fechada", "msbuild", "edge", "disco", "entrada_injetavel", "python310", "ffmpeg",
+         "midi_loopback", "loopback", "nao_perturbe", "tela"}
 
 def test_todas_as_verificacoes_presentes():
     vs = preflight.verificar_tudo()
     assert {v.nome for v in vs} == NOMES
     assert all(isinstance(v.detalhe, str) and v.detalhe for v in vs)
+
+def test_entrada_injetavel_ok_so_com_cabo_virtual(monkeypatch):
+    monkeypatch.setattr(preflight, "_dispositivos_audio", lambda: ["Alto-falantes", "CABLE Input (VB-Audio Cable)"])
+    v = next(v for v in preflight.verificar_tudo() if v.nome == "entrada_injetavel")
+    assert v.ok and v.afeta == ["vb-cable"] and not v.bloqueia
+
+def test_entrada_injetavel_sem_cabo_nao_bloqueia(monkeypatch):
+    monkeypatch.setattr(preflight, "_dispositivos_audio", lambda: ["Alto-falantes", "Microfone"])
+    v = next(v for v in preflight.verificar_tudo() if v.nome == "entrada_injetavel")
+    assert not v.ok and not v.bloqueia and v.afeta == ["vb-cable"]
+
+def test_loopback_ok_quando_pyaudiowpatch_acha_dispositivo(monkeypatch):
+    monkeypatch.setattr(preflight, "_loopback_padrao", lambda: "Alto-falantes (Loopback)")
+    v = next(v for v in preflight.verificar_tudo() if v.nome == "loopback")
+    assert v.ok and v.afeta == ["loopback"] and not v.bloqueia
+    assert "Loopback" in v.detalhe
+
+def test_loopback_nao_ok_quando_pyaudiowpatch_nao_acha(monkeypatch):
+    monkeypatch.setattr(preflight, "_loopback_padrao", lambda: None)
+    v = next(v for v in preflight.verificar_tudo() if v.nome == "loopback")
+    assert not v.ok and v.afeta == ["loopback"]
+
+def test_loopback_padrao_nunca_levanta_sem_pyaudiowpatch(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "pyaudiowpatch":
+            raise ModuleNotFoundError("sem pyaudiowpatch")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert preflight._loopback_padrao() is None
 
 def test_requisitos_ausentes_une_afeta():
     vs = [preflight.Verificacao("a", False, "x", False, ["vb-cable"]),

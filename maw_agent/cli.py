@@ -17,12 +17,23 @@ def registrar(nome: str, ajuda: str, configurar: Callable[[argparse.ArgumentPars
 
 
 def _carregar_modulos() -> None:
-    # importar registra os subcomandos; a lista cresce nas tasks seguintes
+    # importar registra os subcomandos; toda fase_*.py é descoberta automaticamente
     import importlib
-    for mod in ("hook", "fases"):
+    import pkgutil
+
+    import maw_agent
+
+    nomes = ["hook", "fases"]
+    for info in pkgutil.iter_modules(maw_agent.__path__):
+        if info.name.startswith("fase_") and info.name not in nomes:
+            nomes.append(info.name)
+
+    for mod in nomes:
         try:
             importlib.import_module(f"maw_agent.{mod}")
         except ModuleNotFoundError as e:
+            # só engole a ausência do próprio módulo opcional; qualquer outro
+            # ModuleNotFoundError (ex.: uma dependência interna faltando) sobe.
             if e.name != f"maw_agent.{mod}":
                 raise
 

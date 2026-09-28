@@ -7,12 +7,21 @@ import re
 import time
 from pathlib import Path
 
-from . import (achados, alvos, build, catalogo, config, estado, preflight, redacao, sandbox, saude, suite)
+import yaml
+
+from . import (achados, alvos, build, catalogo, config, estado, preflight, redacao, sandbox, saude, sondas,
+               suite, trava_appdata)
 from .cli import registrar
 
 
 def _saida(obj: dict, ok: bool = True) -> int:
-    print(json.dumps(obj, ensure_ascii=False, indent=2))
+    """JSON no stdout. Redirecionado para arquivo (script noturno), o stdout do Windows é cp1252 e não
+    tem "→" nem "✓": nesse caso sai o mesmo JSON só com ASCII (escapes \\uXXXX, que qualquer leitor de
+    JSON devolve iguais) em vez de uma exceção depois de os dados já estarem gravados."""
+    try:
+        print(json.dumps(obj, ensure_ascii=False, indent=2))
+    except UnicodeEncodeError:  # o TextIOWrapper codifica antes de escrever: nada saiu pela metade
+        print(json.dumps(obj, ensure_ascii=True, indent=2))
     return 0 if ok else 1
 
 
@@ -127,32 +136,119 @@ def achados_da_suite(alvo: dict, r: dict) -> list[dict]:
     return out
 
 
+def achados_das_sondas(alvo: dict, blocos_sondas: list[dict], detalhes: list[str],
+                       mapa: dict[str, list[str]], arquivos: dict[str, str] | None = None) -> list[dict]:
+    """Um achado por bloco de sonda do agente que falhou, no item do catálogo que a sonda cobre
+    (`privado/sondas/itens.yaml`: o primeiro item que não é princípio; o princípio vai para
+    `principio`). A sonda é código C++ do próprio agente e pode estar errada: `fonte: sonda` NÃO é
+    mecânica — sem veredito o achado vira provável, e só o advogado-do-diabo o confirma; a causa
+    provável diz isso e aponta o arquivo da sonda. A assinatura `suite:<nome>|<sub>` deixa a
+    consolidação reverificá-lo pela suíte. `arquivos`: nome da sonda → arquivo .cpp."""
+    arquivos = arquivos or {}
+    det = _detalhes_por_bloco(detalhes)
+    out = []
+    for b in blocos_sondas:
+        if not b["falhas"]:
+            continue
+        itens = list(mapa.get(b["nome"], []))
+        principio = next((i.split("/", 1)[1] for i in itens if i.startswith("principio/")), None)
+        item = next((i for i in itens if not i.startswith("principio/")), None) or \
+            (itens[0] if itens else "saude/geral")
+        linhas = det.get((b["nome"], b["sub"]), [])[:6]
+        arq = arquivos.get(b["nome"])
+        out.append({
+            "titulo": f"Sonda do agente falha: {b['nome']} → {b['sub']}", "tipo": "bug",
+            "severidade": "alta" if principio else "media", "prioridade": None,
+            "alvos": [{"alvo": alvo["nome"], "commit": alvo["commit"]}],
+            "item_catalogo": item, "principio": principio,
+            "passos": [f"injetar a sonda do agente no build Debug ({arq or b['nome']}; `sondas injetar`) e compilar",
+                       "MAW_APP.exe --run-tests (build Debug)",
+                       f"ver o bloco '{b['nome']} → {b['sub']}' no relatório da suíte"],
+            "esperado": f"o bloco da sonda '{b['nome']} → {b['sub']}' passa",
+            "obtido": f"{b['falhas']} verificação(ões) falharam. " + " ".join(linhas),
+            "evidencias": [{"arquivo": f"suites/{alvo['nome']}.json", "embutir": False,
+                            "legenda": "relatório completo da suíte (os blocos das sondas ficam em 'sondas')"}],
+            "causa_provavel": {
+                "arquivo_linha": f"privado/sondas/{arq or '<arquivo da sonda>'}",
+                "texto": "hipótese: o bloco é uma sonda — teste do próprio agente, não da suíte da MAW — e a "
+                         "falha pode ser um erro da sonda; antes de mudar a MAW, confira a sonda contra o código "
+                         "da MAW"},
+            "sugestao": "corrigir o código da MAW até o bloco da sonda passar (a sonda é do agente e não vai "
+                        "para o repositório da MAW; se a sonda estiver errada, quem corrige é o agente)",
+            "criterio_aceite": f"o bloco '{b['nome']} → {b['sub']}' passa na suíte do build Debug com as sondas "
+                               "do agente injetadas",
+            "confianca": "confirmado", "assinatura": f"suite:{b['nome']}|{b['sub']}", "fonte": "sonda"})
+    return out
+
+
+def itens_com_sondas(itens: list[dict], mapa: dict[str, list[str]]) -> list[dict]:
+    """Cópia dos itens em que cada item coberto por uma sonda (mapa de `itens.yaml`) cita o cenário
+    `suite:<nome da sonda>` — mesmo que o catálogo ainda não o tenha."""
+    por_item: dict[str, list[str]] = {}
+    for nome, ids in mapa.items():
+        for i in ids:
+            por_item.setdefault(i, []).append(f"suite:{nome}")
+    out = []
+    for it in itens:
+        extras = [c for c in por_item.get(it.get("id"), []) if c not in it.get("cenarios", [])]
+        out.append({**it, "cenarios": list(it.get("cenarios", [])) + extras} if extras else it)
+    return out
+
+
+_RX_PASTA_SONDAS = re.compile(r"(?:^|[\\/])Tests[\\/]Sondas[\\/]", re.IGNORECASE)
+
+
+def sondas_nos_erros(erros: list[str], injetadas: list[str]) -> set[str]:
+    """Quais das sondas injetadas (nomes de arquivo .cpp) aparecem nos erros do MSBuild: o arquivo do
+    erro de compilação ou o .obj do erro de link. Um erro na pasta das sondas com um nome que não é de
+    nenhuma delas deixa todas sob suspeita."""
+    por_base = {Path(x).stem.lower(): x for x in injetadas}
+    culpadas: set[str] = set()
+    for linha in erros:
+        m = _RX_ERRO_BUILD.match(linha.strip())
+        arq = m["arq"].strip() if m else linha
+        base = re.split(r"[\\/]", arq)[-1].strip()
+        stem = base.rsplit(".", 1)[0].lower()
+        if stem in por_base:
+            culpadas.add(por_base[stem])
+        elif _RX_PASTA_SONDAS.search(arq):
+            culpadas.update(injetadas)
+    return culpadas
+
+
 # verificações que a suíte e o benchmark cobrem sozinhos; 'revisao' não é cobertura dinâmica
 COBRIVEIS_NO_M1 = ("suite", "benchmark")
 
 
 def resultados_suite_por_item(itens: list[dict], blocos: list[dict],
-                              cobertas: tuple[str, ...] | set[str] = ("suite",)) -> dict[str, tuple[str, str | None]]:
+                              cobertas: tuple[str, ...] | set[str] = ("suite",),
+                              motivos_ausentes: dict[str, str] | None = None) -> dict[str, tuple[str, str | None]]:
     """Resultado de cada item do catálogo que cita blocos da suíte (`suite:<nome exato do bloco>`).
 
     - algum bloco citado falhou → falhou;
-    - algum bloco citado não existe → nao_testavel listando os ausentes (mesmo que outros passem);
-    - todos passaram → passou só se toda a `verificacao` do item foi coberta nesta sprint (`cobertas`);
-      senão nao_testavel "parcial", dizendo o que falta e para qual marco."""
-    cobertas = set(cobertas)
+    - algum bloco citado não existe → nao_testavel listando os ausentes (mesmo que outros passem), com
+      o motivo conhecido de cada um em `motivos_ausentes` (ex.: a sonda não compilou neste alvo);
+    - todos passaram → passou só se toda a `verificacao` do item foi coberta nesta sprint (`cobertas`,
+      mais `sonda` quando o item cita um bloco de sonda do agente); senão nao_testavel "parcial",
+      dizendo o que falta e para qual marco."""
+    motivos_ausentes = motivos_ausentes or {}
     out: dict[str, tuple[str, str | None]] = {}
     for it in itens:
         nomes = list(dict.fromkeys(c[len("suite:"):] for c in it.get("cenarios", []) if c.startswith("suite:")))
         if not nomes:
             continue
+        cobertas_item = set(cobertas) | ({"sonda"} if any(sondas.e_sonda(n) for n in nomes) else set())
         casados = [b for b in blocos if b["nome"] in nomes]
         presentes = {b["nome"] for b in casados}
         ausentes = [n for n in nomes if n not in presentes]
-        restantes = [v for v in it.get("verificacao", []) if v not in cobertas]
+        restantes = [v for v in it.get("verificacao", []) if v not in cobertas_item]
         if any(b["falhas"] for b in casados):
             out[it["id"]] = ("falhou", None)
         elif ausentes:
-            out[it["id"]] = ("nao_testavel", f"bloco da suíte não encontrado: {', '.join(ausentes)}")
+            conhecidos = [f"{n}: {motivos_ausentes[n]}" for n in ausentes if n in motivos_ausentes]
+            sem_motivo = [n for n in ausentes if n not in motivos_ausentes]
+            partes = conhecidos + ([f"bloco da suíte não encontrado: {', '.join(sem_motivo)}"] if sem_motivo else [])
+            out[it["id"]] = ("nao_testavel", "; ".join(partes))
         elif restantes:
             out[it["id"]] = ("nao_testavel", f"parcial: blocos da suíte passaram ({', '.join(nomes)}); "
                                              f"{', '.join(restantes)} previstas para o marco {it.get('marco', '?')}")
@@ -247,7 +343,8 @@ def _veredito_automatico(ultimo: dict, origem: str, pasta: Path) -> str:
         return "nao_verificavel"
     if assin.startswith("suite:"):
         nome, _, sub = assin[len("suite:"):].partition("|")
-        for b in s.get("blocos", []):
+        # os blocos das sondas do agente ficam à parte, em "sondas"
+        for b in s.get("blocos", []) + (s.get("sondas") or {}).get("blocos", []):
             if b["nome"] == nome and b["sub"] == sub:
                 return "persiste" if b["falhas"] else "corrigido"
         return "nao_verificavel"
@@ -269,14 +366,14 @@ def _veredito_automatico(ultimo: dict, origem: str, pasta: Path) -> str:
 
 
 def reverificacoes_automaticas(historico: dict, alvos_sprint: list[dict], pasta: Path) -> dict[str, str]:
-    """Reverificação dos achados abertos de fonte build/suíte: para cada alvo do achado que existe
+    """Reverificação dos achados abertos de fonte build/suíte/sonda: para cada alvo do achado que existe
     nesta sprint (quem compartilha a árvore usa a execução da origem), olha o build/suíte desta sprint.
     Vários alvos: vale o mais conservador."""
     por_nome = {a["nome"]: a for a in alvos_sprint}
     out: dict[str, str] = {}
     for reg in historico.get("itens", {}).values():
         ultimo = reg.get("ultimo") or {}
-        if reg.get("estado") not in _ESTADOS_ABERTOS or ultimo.get("fonte") not in ("build", "suite"):
+        if reg.get("estado") not in _ESTADOS_ABERTOS or ultimo.get("fonte") not in FONTES_REVERIFICADAS:
             continue
         vereditos = []
         for x in ultimo.get("alvos", []):
@@ -305,7 +402,11 @@ def separar_validos(brutos: list[tuple[str, dict]]) -> tuple[list[dict], list[st
 
 _RESULTADOS_VEREDITO = ("confirmado", "provavel", "derrubado")
 # achados mecânicos: a evidência é a saída da ferramenta, não um julgamento
-FONTES_MECANICAS = ("build", "suite")
+FONTES_MECANICAS = ("build", "suite", "e2e", "servico")
+# só as fases da própria CLI produzem estas fontes (a de sonda não é mecânica: passa pelo advogado)
+FONTES_DA_CLI = FONTES_MECANICAS + ("sonda",)
+# fontes que a consolidação reverifica sozinha pelo build/suíte desta sprint
+FONTES_REVERIFICADAS = ("build", "suite", "sonda")
 
 
 def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]]:
@@ -315,8 +416,11 @@ def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]
     curta, objeto sem `resultado` válido) entra com `confianca: provavel` e `veredito: null`, e seu id()
     vai para o segundo retorno (o contador "sem verificação adversarial"). Achado mecânico (`fonte`
     build/suite) sem veredito mantém a confiança e não entra no contador; um veredito presente vale
-    para ele como para qualquer outro (ex.: `derrubado`). Veredito ilegível e achado bruto ilegível
-    viram mensagens para `erros_agente.json`. Nunca levanta exceção por conteúdo ruim."""
+    para ele como para qualquer outro (ex.: `derrubado`). Veredito legível promove/rebaixa a
+    `confianca` do achado (spec §11.3): `confirmado` vira `confirmado`, `provavel` vira `provavel`;
+    `derrubado` não mexe na confiança (o achado sai do PDF em `achados.consolidar`). Veredito
+    ilegível e achado bruto ilegível viram mensagens para `erros_agente.json`. Nunca levanta
+    exceção por conteúdo ruim."""
     pasta = Path(pasta)
     entradas: list[tuple[str, dict]] = []
     sem_verificacao: set[int] = set()
@@ -357,9 +461,15 @@ def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]
                 else:
                     veredito = vlista[i]
             a["veredito"] = veredito
-            if veredito is None and a.get("fonte") not in FONTES_MECANICAS:
-                a["confianca"] = "provavel"
-                sem_verificacao.add(id(a))
+            if veredito is None:
+                if a.get("fonte") not in FONTES_MECANICAS:
+                    a["confianca"] = "provavel"
+                    sem_verificacao.add(id(a))
+            elif veredito["resultado"] in ("confirmado", "provavel"):
+                # a verificação adversarial vale mais que a confiança de quem achou (spec §11.3):
+                # confirmado promove, provável rebaixa. Derrubado sai do PDF em achados.consolidar,
+                # então sua confiança não importa mais.
+                a["confianca"] = veredito["resultado"]
             entradas.append((origem, a))
     return entradas, sem_verificacao, mensagens
 
@@ -371,9 +481,9 @@ def conferir_referencias(lista: list[dict], ids_catalogo: set[str] | None,
     `suite` são reservadas: só as fases mecânicas da própria CLI produzem esses achados."""
     erros: list[str] = []
     for i, a in enumerate(lista):
-        if a.get("fonte") in FONTES_MECANICAS:
-            erros.append(f"achado {i}: fonte '{a['fonte']}' é reservada às fases mecânicas da CLI "
-                         "(`sprint compilar` e `sprint suite`); use o nome do agente que encontrou o achado")
+        if a.get("fonte") in FONTES_DA_CLI:
+            erros.append(f"achado {i}: fonte '{a['fonte']}' é reservada às fases da CLI "
+                         "(`sprint compilar`, `sprint suite`...); use o nome do agente que encontrou o achado")
     if alvos_sprint is None:
         return erros + ["alvos.json da sprint ausente: rode `sprint preparar` antes de registrar achados"]
     for i, a in enumerate(lista):
@@ -393,10 +503,19 @@ def conferir_referencias(lista: list[dict], ids_catalogo: set[str] | None,
 
 # ---------- ambiente: %APPDATA%\MAW ----------
 
-def _restaurar_ambiente(e: estado.Estado, backup: Path, quem: str) -> dict:
+def _restaurar_ambiente(e: estado.Estado, backup: Path, quem: str, extra: dict | None = None) -> dict:
     """Restaura o %APPDATA%\\MAW do backup, confere o manifesto, apaga a bandeira appdata-sujo.json
     e depois o backup (que contém a chave do Gemini). Registra tudo no estado da sprint."""
-    reg: dict = {"quem": quem, "backup": str(backup), "verificado": False, "erro": None, "backup_apagado": False}
+    reg: dict = {"quem": quem, **(extra or {}), "backup": str(backup), "verificado": False, "erro": None,
+                 "backup_apagado": False}
+    if suite.maw_aberta():
+        # uma MAW aberta (a do usuário, aberta no meio da fase) gravaria por cima, ao sair, as configurações
+        # de teste que tem na memória — e o único backup já teria sido apagado. Nada é tocado: a bandeira e
+        # o backup ficam, e a próxima retomada restaura (fases.restaurar_pendencias_ambiente).
+        reg.update(adiada=True, erro=_MOTIVO_ADIADA)
+        _acrescentar_limitacoes(e, "ambiente", [_MOTIVO_ADIADA])
+        e.registrar_restauracao(reg)
+        return reg
     try:
         sandbox.restaurar_pasta(Path(backup))
         reg["verificado"] = True
@@ -410,98 +529,234 @@ def _restaurar_ambiente(e: estado.Estado, backup: Path, quem: str) -> dict:
         except OSError as ex:
             reg["erro_ao_apagar"] = redacao.redigir(str(ex))
         _retirar_limitacao(e, "ambiente", _MOTIVO_ADIADA)  # se tinha sido adiada, não está mais
+        _retirar_limitacao(e, "ambiente", _MOTIVO_OCUPADA)
     e.registrar_restauracao(reg)
     return reg
 
 
 _MOTIVO_ADIADA = ("restauração do %APPDATA%\\MAW adiada: MAW aberta — feche a MAW e rode "
                   "`sprint iniciar` de novo")
+# Toda mudança no %APPDATA%\\MAW (sessão de GUI, suíte, calibração, restauração) acontece com a trava da
+# máquina na mão (`trava_appdata`); quanto esperar que outra sessão do agente a solte.
+ESPERA_TRAVA_APPDATA = 1800.0
+_MOTIVO_OCUPADA = ("restauração do %APPDATA%\\MAW adiada: outra sessão do agente estava usando a MAW (trava "
+                   "ocupada) — rode `sprint iniciar` de novo quando ela terminar")
+
+
+BANDEIRA = "appdata-sujo.json"
 
 
 def _pastas_com_pendencia() -> list[Path]:
     """Pastas de sprint com appdata-sujo.json, da mais antiga para a mais nova."""
     return [p for p in estado._existentes(config.RELATORIOS)
-            if (p / "appdata-sujo.json").exists() and (p / "estado.json").exists()]
+            if (p / BANDEIRA).exists() and (p / "estado.json").exists()]
+
+
+def _bandeira_avulsa() -> Path:
+    """A bandeira do driver de GUI numa sessão fora de sprint: ao lado da pasta dos backups."""
+    return Path(config.BACKUPS).parent / BANDEIRA
+
+
+def _bandeira_calibracao() -> Path:
+    """A bandeira da calibração rodada fora de sprint."""
+    return Path(config.WORK) / "calibracao" / BANDEIRA
+
+
+def pendencias_ambiente() -> list[dict]:
+    """Toda bandeira appdata-sujo.json ainda presente, de todos os lugares que sujam o %APPDATA%\\MAW:
+    as pastas das sprints, a sessão avulsa do driver de GUI e a calibração fora de sprint.
+
+    Cada uma: {"flag": Path, "origem": "sprint"|"avulsa"|"calibracao", "desde": str | None,
+    "backup": Path | None} (+ "erro" quando a bandeira é ilegível), da mais antiga (`desde`) para a
+    mais nova. Uma bandeira ilegível ou sem `desde` legível fica na frente: sem saber a idade dela,
+    nenhuma outra pode ser tomada pelo estado original."""
+    candidatas = [(p / BANDEIRA, "sprint") for p in _pastas_com_pendencia()]
+    candidatas += [(b, o) for b, o in ((_bandeira_avulsa(), "avulsa"), (_bandeira_calibracao(), "calibracao"))
+                   if b.is_file()]
+    out = []
+    for flag, origem in candidatas:
+        ent: dict = {"flag": flag, "origem": origem, "desde": None, "backup": None}
+        try:
+            d = json.loads(flag.read_text(encoding="utf-8"))
+            ent["backup"] = Path(d["backup"])
+            ent["desde"] = str(d["desde"]) if d.get("desde") else None
+        except (OSError, ValueError, KeyError, TypeError) as ex:
+            ent["erro"] = f"{BANDEIRA} ilegível: {ex}"
+        out.append(ent)
+    def idade(ent: dict) -> str:
+        try:  # `desde` que não é um instante legível conta como de idade desconhecida: vai para a frente
+            time.strptime(ent["desde"] or "", "%Y-%m-%dT%H:%M:%S")
+            return ent["desde"]
+        except ValueError:
+            return ""
+
+    # sorted é estável: no empate fica a ordem sprints (por número) → avulsa → calibração
+    return sorted(out, key=idade)
 
 
 def _backup_da_bandeira(pasta: Path) -> Path:
-    return Path(json.loads((pasta / "appdata-sujo.json").read_text(encoding="utf-8"))["backup"])
+    return Path(json.loads((Path(pasta) / BANDEIRA).read_text(encoding="utf-8"))["backup"])
 
 
-def _restaurar_pendente(e: estado.Estado) -> dict:
-    """Restaura o %APPDATA%\\MAW do backup citado na bandeira appdata-sujo.json da sprint `e`."""
+def _restaurar_pendente(e) -> dict:
+    """Restaura o %APPDATA%\\MAW do backup citado na bandeira appdata-sujo.json da pasta de `e`
+    (sem olhar as outras bandeiras; quem quer a regra da mais antiga usa
+    `restaurar_pendencias_ambiente`)."""
     try:
         backup = _backup_da_bandeira(e.pasta)
     except (OSError, ValueError, KeyError, TypeError) as ex:
         reg = {"quem": "retomada", "backup": None, "verificado": False, "backup_apagado": False,
-               "erro": f"appdata-sujo.json ilegível: {ex}"}
+               "erro": f"{BANDEIRA} ilegível: {ex}"}
         e.registrar_restauracao(reg)
         return reg
     return _restaurar_ambiente(e, backup, "retomada")
 
 
-def _restaurar_pendentes(atual: estado.Estado | None = None) -> list[dict]:
-    """Restaura o %APPDATA%\\MAW deixado sujo por execuções que caíram (appdata-sujo.json).
+def _descrever_bandeira(ent: dict) -> str:
+    if ent["origem"] == "sprint":
+        return f"{ent['flag'].parent.name}/{BANDEIRA}"
+    return f"{ent['origem']}: {ent['flag']}"
 
-    - MAW do usuário aberta: não restaura nada (ela gravaria por cima, ao salvar, as configurações que
-      tem na memória); bandeiras e backups ficam, e o adiamento vai para o estado e para as limitações.
-    - Várias sprints pendentes: só o backup da MAIS ANTIGA é restaurado, porque é o único tirado antes
-      de o agente sujar o ambiente (um backup mais novo pode ter copiado um estado já sujo). Só depois
-      da restauração verificada as pendências mais novas são descartadas (bandeira e backup apagados);
-      se ela falhar, as mais novas ficam intocadas.
 
-    `atual` é o estado que o chamador tem em mãos: é ele que recebe o registro da sua própria pasta
-    (outra instância seria sobrescrita quando o chamador salvasse)."""
-    def carregar(pasta: Path) -> estado.Estado:
-        if atual is not None and Path(atual.pasta).resolve() == Path(pasta).resolve():
-            return atual
-        return estado.carregar(pasta)
+def _de_onde(ent: dict) -> str:
+    return {"sprint": ent["flag"].parent.name, "avulsa": "a sessão avulsa do driver de GUI",
+            "calibracao": "a calibração fora de sprint"}[ent["origem"]]
 
-    pastas = _pastas_com_pendencia()
-    if not pastas:
+
+class _RegistroForaDeSprint:
+    """Registro de quem sujou o ambiente fora de uma sprint (sessão avulsa, calibração): a pasta é a
+    da bandeira; as restaurações ficam na memória (e na sprint atual, quando houver)."""
+
+    def __init__(self, pasta: Path):
+        self.pasta = Path(pasta)
+        self.restauracoes: list[dict] = []
+
+    def registrar_restauracao(self, registro: dict) -> None:
+        self.restauracoes.append({"quando": _agora(), **registro})
+
+
+def _processar_pendencias(motivo: str, atual: estado.Estado | None) -> list[tuple[str, dict]]:
+    """Núcleo de `restaurar_pendencias_ambiente`: [(categoria, registro)] na ordem em que aconteceram.
+    Com pendência, tudo acontece com a trava do %APPDATA%\\MAW na mão (reentrante: quem já a tem, como a
+    sessão de GUI, entra na hora); sem a trava no prazo, tudo é adiado sem tocar em nada."""
+    if not pendencias_ambiente():
         return []
-    out = []
-    if suite.maw_aberta():
-        for pasta in pastas:
-            e = carregar(pasta)
-            try:
-                backup = str(_backup_da_bandeira(pasta))
-            except (OSError, ValueError, KeyError, TypeError):
-                backup = None
-            reg = {"quem": "retomada", "backup": backup, "verificado": False, "backup_apagado": False,
-                   "adiada": True, "erro": _MOTIVO_ADIADA}
-            e.registrar_restauracao(reg)
-            _acrescentar_limitacoes(e, "ambiente", [_MOTIVO_ADIADA])
-            out.append({"sprint": pasta.name, **reg})
+    posse = trava_appdata.adquirir(ESPERA_TRAVA_APPDATA)
+    try:
+        return _processar_pendencias_na_trava(motivo, atual, ocupada=posse is None)
+    finally:
+        if posse is not None:
+            posse.liberar()
+
+
+def _processar_pendencias_na_trava(motivo: str, atual: estado.Estado | None,
+                                   ocupada: bool) -> list[tuple[str, dict]]:
+    def registro(ent: dict):
+        pasta = ent["flag"].parent
+        if atual is not None and Path(atual.pasta).resolve() == pasta.resolve():
+            return atual
+        if ent["origem"] == "sprint":
+            return estado.carregar(pasta)
+        return _RegistroForaDeSprint(pasta)
+
+    def anotar(ent: dict, reg_obj, reg: dict) -> dict:
+        """O registro vai para o dono da bandeira; o de fora de sprint também vai para a sprint atual
+        (é ela que declara no PDF o que foi feito com o %APPDATA%\\MAW)."""
+        if ent["origem"] != "sprint" and atual is not None and reg_obj is not atual:
+            atual.registrar_restauracao({**reg, "origem": ent["origem"], "bandeira": str(ent["flag"])})
+        sprint = ent["flag"].parent.name if ent["origem"] == "sprint" else None
+        return {"sprint": sprint, "origem": ent["origem"], "flag": str(ent["flag"]), "desde": ent["desde"], **reg}
+
+    pend = pendencias_ambiente()  # de novo, com a trava na mão: quem a segurava pode ter limpado a dele
+    if not pend:
+        return []
+    if atual is None:  # quem chamou não tem a sprint em mãos: a em andamento (se houver) declara no PDF
+        try:
+            atual = estado.em_andamento(config.RELATORIOS)
+        except (OSError, ValueError, KeyError):
+            atual = None
+    out: list[tuple[str, dict]] = []
+    base = {"quem": "retomada", "motivo": motivo}
+    if ocupada or suite.maw_aberta():
+        # a MAW aberta gravaria por cima, ao salvar, as configurações que tem na memória; outra sessão do
+        # agente com a trava está no meio do próprio ambiente de teste: nada é tocado
+        adiada = _MOTIVO_OCUPADA if ocupada else _MOTIVO_ADIADA
+        for ent in pend:
+            reg_obj = registro(ent)
+            reg = {**base, "backup": str(ent["backup"]) if ent["backup"] else None, "verificado": False,
+                   "backup_apagado": False, "adiada": True, "erro": adiada}
+            reg_obj.registrar_restauracao(reg)
+            if isinstance(reg_obj, estado.Estado):
+                _acrescentar_limitacoes(reg_obj, "ambiente", [adiada])
+            out.append(("adiadas", anotar(ent, reg_obj, reg)))
+        if atual is not None:
+            _acrescentar_limitacoes(atual, "ambiente", [adiada])
         return out
-    mais_antiga, *mais_novas = pastas
-    reg = _restaurar_pendente(carregar(mais_antiga))
-    out.append({"sprint": mais_antiga.name, **reg})
+    # só o backup MAIS ANTIGO foi tirado antes de o agente sujar o ambiente; um mais novo pode ter
+    # copiado um estado já sujo. Os mais novos só são descartados depois da restauração verificada.
+    mais_antiga, *mais_novas = pend
+    reg_obj = registro(mais_antiga)
+    if mais_antiga["backup"] is None:
+        reg = {**base, "backup": None, "verificado": False, "backup_apagado": False, "erro": mais_antiga["erro"]}
+        reg_obj.registrar_restauracao(reg)
+    else:
+        reg = _restaurar_ambiente(reg_obj, mais_antiga["backup"], "retomada", {"motivo": motivo})
+    out.append(("restauradas" if reg["verificado"] else "erros", anotar(mais_antiga, reg_obj, reg)))
     if not reg["verificado"]:
         return out
-    for pasta in mais_novas:
-        e = carregar(pasta)
-        descarte = {"quem": "retomada", "backup": None, "verificado": True, "backup_apagado": False,
-                    "descartado": f"o backup mais antigo, de {mais_antiga.name}, é o estado original e já foi "
-                                  "restaurado; este backup, mais novo, foi apagado sem ser restaurado"}
-        try:
-            backup = _backup_da_bandeira(pasta)
-            descarte["backup"] = str(backup)
-            sandbox.descartar_backup(backup)
-            descarte["backup_apagado"] = True
-        except (OSError, ValueError, KeyError, TypeError) as ex:
-            descarte["erro_ao_apagar"] = redacao.redigir(str(ex))
-        sandbox.remover(pasta / "appdata-sujo.json")
-        _retirar_limitacao(e, "ambiente", _MOTIVO_ADIADA)
-        e.registrar_restauracao(descarte)
-        out.append({"sprint": pasta.name, **descarte})
+    for ent in mais_novas:
+        reg_obj = registro(ent)
+        descarte = {**base, "backup": str(ent["backup"]) if ent["backup"] else None, "verificado": True,
+                    "backup_apagado": False,
+                    "descartado": f"o backup mais antigo, de {_de_onde(mais_antiga)}, é o estado original e já "
+                                  "foi restaurado; este backup, mais novo, foi apagado sem ser restaurado"}
+        if ent["backup"] is not None:
+            try:
+                sandbox.descartar_backup(ent["backup"])
+                descarte["backup_apagado"] = True
+            except OSError as ex:
+                descarte["erro_ao_apagar"] = redacao.redigir(str(ex))
+        sandbox.remover(ent["flag"])
+        if isinstance(reg_obj, estado.Estado):
+            _retirar_limitacao(reg_obj, "ambiente", _MOTIVO_ADIADA)
+        reg_obj.registrar_restauracao(descarte)
+        out.append(("descartadas", anotar(ent, reg_obj, descarte)))
+    if atual is not None and not pendencias_ambiente():
+        _retirar_limitacao(atual, "ambiente", _MOTIVO_ADIADA)
     return out
 
 
+def restaurar_pendencias_ambiente(motivo: str, atual: estado.Estado | None = None) -> dict:
+    """Restaura o %APPDATA%\\MAW deixado sujo por execuções que caíram, olhando as bandeiras de todos
+    os lugares (`pendencias_ambiente`). `motivo` diz quem pediu (vai para cada registro).
+
+    - MAW aberta (`suite.maw_aberta()`): nada é restaurado nem apagado; todas vão para "adiadas",
+      com o adiamento registrado (e nas limitações da sprint).
+    - Senão, só o backup da bandeira mais antiga (`desde`) é restaurado, com o manifesto conferido;
+      bandeira e backup só são apagados depois da restauração verificada. As mais novas são então
+      descartadas (backup apagado sem restaurar, bandeira removida), e isso fica registrado. Se a mais
+      antiga falhar (ou for ilegível), vai para "erros" e as outras ficam intocadas.
+
+    Os registros das sprints vão para o `estado.json` de cada uma (`atual`, se for a mesma pasta, é a
+    instância que o chamador tem em mãos); os de fora de sprint vão para `atual` ou, sem ele, para a
+    sprint em andamento (se houver), que os declara no PDF.
+    Devolve {"restauradas", "descartadas", "adiadas", "erros"}: listas de registros."""
+    out: dict[str, list[dict]] = {"restauradas": [], "descartadas": [], "adiadas": [], "erros": []}
+    for categoria, reg in _processar_pendencias(motivo, atual):
+        out[categoria].append(reg)
+    return out
+
+
+def _restaurar_pendentes(atual: estado.Estado | None = None) -> list[dict]:
+    """Compatibilidade: o mesmo que `restaurar_pendencias_ambiente("retomada", atual)`, como uma
+    lista de registros na ordem em que aconteceram (cada um com "sprint": nome ou None)."""
+    return [reg for _, reg in _processar_pendencias("retomada", atual)]
+
+
 def _situacao_do_ambiente(e: estado.Estado) -> tuple[bool, str | None]:
-    """Restaurado = nenhuma bandeira pendente (em nenhuma sprint) e a última restauração de cada
+    """Restaurado = nenhuma bandeira pendente (em nenhum lugar) e a última restauração de cada
     backup desta sprint verificada."""
-    erros = [f"restauração do %APPDATA%\\MAW pendente ({p.name}/appdata-sujo.json)" for p in _pastas_com_pendencia()]
+    erros = [f"restauração do %APPDATA%\\MAW pendente ({_descrever_bandeira(p)})" for p in pendencias_ambiente()]
     ultima: dict[str, dict] = {}
     for r in e.restauracoes:
         ultima[str(r.get("backup"))] = r
@@ -576,10 +831,13 @@ def cmd_sprint(args: argparse.Namespace) -> int:
 
 
 def _iniciar(args) -> int:
-    restauracoes = _restaurar_pendentes()  # antes de qualquer coisa: o ambiente volta ao original
     e = None if args.nova else estado.em_andamento()
     retomada = e is not None
     e = e or estado.nova_sprint()
+    # antes de qualquer fase: o ambiente volta ao original (bandeiras de todos os lugares); o que foi
+    # feito com bandeiras de fora de sprint fica registrado nesta sprint
+    restauracoes = [reg for _, reg in _processar_pendencias("sprint iniciar", e)]
+    e = estado.carregar(e.pasta)
     return _saida({"sprint": e.nome, "pasta": str(e.pasta), "retomada": retomada,
                    "passos_concluidos": sorted(k for k in e.passos if e.feito(k)),
                    "restauracoes": restauracoes},
@@ -623,6 +881,141 @@ def _preparar(args) -> int:
 _CONFIGS = ("Release", "Debug")
 
 
+# ---------- sondas do agente no build Debug ----------
+
+# o que `sondas.injetar` pode levantar por conteúdo ou disco (ParseError do XML é SyntaxError); a
+# sandbox recusando a escrita não entra: isso é erro do agente e tem de aparecer
+_ERROS_DE_SONDA = (OSError, ValueError, SyntaxError)
+
+
+def _nomes_das_sondas(arquivo: Path) -> list[str]:
+    try:
+        return sondas.nomes(arquivo)
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def _mapa_sondas(e: estado.Estado) -> dict[str, list[str]]:
+    """O mapa sonda → itens (`privado/sondas/itens.yaml`); ilegível vira limitação e mapa vazio."""
+    try:
+        return sondas.carregar_mapa()
+    except (OSError, ValueError, AttributeError, yaml.YAMLError) as ex:
+        _acrescentar_limitacoes(e, "sondas", [f"mapa de itens das sondas ilegível: {ex}"])
+        return {}
+
+
+def _gravar_sondas(e: estado.Estado, alvo: str, info: dict) -> None:
+    p = e.pasta / "sondas.json"
+    sandbox.escrever_json(p, {**(_ler_json(p, {}) or {}), alvo: info})
+
+
+def _marcar_itens_sem_sonda(e: estado.Estado, alvo: str, ausentes: dict[str, str]) -> None:
+    """Itens do catálogo cobertos por uma sonda que não vai rodar neste alvo: nao_testavel com o motivo
+    (a fase `suite` refaz a célula depois, com o mesmo motivo para a sonda ausente)."""
+    mapa = _mapa_sondas(e)
+    for nome, motivo in ausentes.items():
+        for item in mapa.get(nome, []):
+            catalogo.registrar_resultado(e.pasta, item, alvo, "nao_testavel", f"{nome}: {motivo}", fonte="sonda")
+
+
+def _injetar_sondas(e: estado.Estado, alvo: str, wt: Path) -> tuple[list[Path], dict | None]:
+    """Antes do build Debug, as sondas do privado entram na worktree do alvo (`sondas.injetar` é uma
+    sincronização idempotente; o grupo do projeto só vale no Debug). Devolve (arquivos injetados,
+    registro para sondas.json), ou ([], None) quando o privado não tem sondas. Injeção que falha vira
+    limitação, o projeto volta ao original e o build segue sem sondas."""
+    arquivos = sondas.listar()
+    if not arquivos:
+        if (Path(wt) / sondas.PASTA_NA_WORKTREE).exists():  # sondas que saíram do privado saem da worktree
+            try:
+                sondas.injetar(wt, [])
+            except _ERROS_DE_SONDA as ex:
+                _acrescentar_limitacoes(e, "sondas", [f"sondas antigas não retiradas de {alvo}: "
+                                                      f"{redacao.redigir(str(ex))}"])
+        return [], None
+    try:
+        r = sondas.injetar(wt, arquivos)
+    except _ERROS_DE_SONDA as ex:  # projeto ausente, XML inválido, disco
+        lim = f"sondas não injetadas em {alvo}: {redacao.redigir(str(ex))}"
+        try:
+            sondas.injetar(wt, [])  # o projeto volta a ser o original
+        except _ERROS_DE_SONDA:
+            pass
+        _acrescentar_limitacoes(e, "sondas", [lim])
+        return [], {"injetadas": [], "puladas": {}, "excluidas": {}, "erro": lim,
+                    "ausentes": {n: lim for a in arquivos for n in _nomes_das_sondas(a)}}
+    por_nome = {a.name: a for a in arquivos}
+    ausentes: dict[str, str] = {}
+    for arq, motivo in r["puladas"].items():
+        for n in _nomes_das_sondas(por_nome[arq]):
+            ausentes[n] = f"sonda pulada em {alvo}: {motivo}"
+    _acrescentar_limitacoes(e, "sondas", [f"sonda {arq} pulada em {alvo}: {m}" for arq, m in r["puladas"].items()])
+    return ([por_nome[x] for x in r["injetadas"]],
+            {"injetadas": list(r["injetadas"]), "puladas": dict(r["puladas"]), "excluidas": {}, "erro": None,
+             "ausentes": ausentes})
+
+
+def _guardar_log_da_tentativa(r: build.ResultadoBuild, tentativa: int) -> str | None:
+    """O log do build que falhou com as sondas é sobrescrito pela nova tentativa: fica uma cópia."""
+    origem = Path(r.log)
+    if not origem.is_file():
+        return None
+    destino = origem.with_name(f"{origem.stem}-com-sondas-{tentativa}{origem.suffix}")
+    sandbox.copiar(origem, destino)
+    return destino.name
+
+
+def _compilar_debug_com_sondas(e: estado.Estado, alvo: str, wt: Path, logs: Path,
+                               injetadas: list[Path], info: dict) -> build.ResultadoBuild:
+    """Build Debug com as sondas. Se ele falha com sonda injetada, a falha só é da MAW quando continua
+    sem as sondas:
+    - as sondas citadas nos erros (arquivo ou .obj) saem e o Debug é compilado de novo; cada uma vira
+      a limitação "sonda não compila em <alvo>: ..." e os itens dela ficam nao_testavel;
+    - erro sem sonda citada, com sondas ainda injetadas: todas saem para isolar a falha. Se sem elas
+      compila, as sondas eram a causa (erro num cabeçalho da MAW, por exemplo); se não, a falha é da
+      MAW e vira achado de build com os erros do build SEM sondas.
+    Cada tentativa tira ao menos uma sonda, então são no máximo len(injetadas) + 1 builds."""
+    r = build.compilar(alvo, wt, "Debug", logs)
+    por_nome = {p.name: p for p in injetadas}
+    atuais = sorted(por_nome)
+    tentativa = 0
+    while not r.ok and atuais:
+        tentativa += 1
+        culpadas = sondas_nos_erros(r.erros, atuais)
+        suspeitas = sorted(culpadas or atuais)
+        log = _guardar_log_da_tentativa(r, tentativa)
+        onde = f" (log {log})" if log else ""
+        detalhe = {}
+        for arq in suspeitas:
+            linhas = [l for l in r.erros if Path(arq).stem.lower() in l.lower()] if culpadas else []
+            detalhe[arq] = ("; ".join((linhas or r.erros)[:3]) or "sem mensagem de erro") + onde
+        atuais = [x for x in atuais if x not in suspeitas]
+        try:
+            sondas.injetar(wt, [por_nome[x] for x in atuais])
+        except _ERROS_DE_SONDA as ex:
+            _acrescentar_limitacoes(e, "sondas", [f"sondas não retiradas do build Debug de {alvo} para isolar a "
+                                                  f"falha: {redacao.redigir(str(ex))}"])
+            break
+        r = build.compilar(alvo, wt, "Debug", logs)
+        if culpadas or r.ok:  # a sonda não compila (citada nos erros, ou sem ela o Debug compila)
+            for arq in suspeitas:
+                motivo = f"sonda não compila em {alvo}: {arq}: {detalhe[arq]}"
+                info["excluidas"][arq] = motivo
+                for n in _nomes_das_sondas(por_nome[arq]):
+                    info["ausentes"][n] = motivo
+                _acrescentar_limitacoes(e, "sondas", [motivo])
+        else:  # sem as sondas o Debug também falha: a falha é da MAW
+            for arq in suspeitas:
+                motivo = f"sonda retirada do build Debug de {alvo} para isolar uma falha da MAW"
+                info["excluidas"][arq] = motivo
+                for n in _nomes_das_sondas(por_nome[arq]):
+                    info["ausentes"][n] = motivo
+            _acrescentar_limitacoes(e, "sondas", [
+                f"sondas retiradas do build Debug de {alvo} para isolar a falha, que continuou sem elas: a falha é "
+                f"da MAW ({', '.join(suspeitas)})"])
+    info["injetadas"] = atuais
+    return r
+
+
 def _compilar(args) -> int:
     e = _sprint_atual()
     ok_geral = True
@@ -637,8 +1030,20 @@ def _compilar(args) -> int:
                 resumo.append({"alvo": a["nome"], "config": cfg, "retomado": True})
                 continue
             e.iniciar(passo)
-            r = build.compilar(a["nome"], wt, cfg, e.pasta / "evidencias" / "builds")
-            sandbox.escrever_json(e.pasta / "builds" / f"{a['nome']}-{cfg}.json", r.como_dict())
+            logs = e.pasta / "evidencias" / "builds"
+            info_sondas = None
+            if cfg == "Debug":  # o Release (E2E, benchmark) nunca leva sonda
+                injetadas, info_sondas = _injetar_sondas(e, a["nome"], wt)
+            if info_sondas is not None:
+                r = _compilar_debug_com_sondas(e, a["nome"], wt, logs, injetadas, info_sondas)
+                _gravar_sondas(e, a["nome"], info_sondas)
+                _marcar_itens_sem_sonda(e, a["nome"], info_sondas["ausentes"])
+            else:
+                r = build.compilar(a["nome"], wt, cfg, logs)
+            dados_build = r.como_dict()
+            if info_sondas and info_sondas["excluidas"]:
+                dados_build["sondas_excluidas"] = info_sondas["excluidas"]
+            sandbox.escrever_json(e.pasta / "builds" / f"{a['nome']}-{cfg}.json", dados_build)
             catalogo.registrar_resultado(e.pasta, f"saude/build-{cfg.lower()}", a["nome"],
                                          "passou" if r.ok else "falhou", fonte="build")
             if not r.ok:
@@ -668,6 +1073,33 @@ def _registrar_suite_nao_rodou(e: estado.Estado, nome: str, itens: list[dict], m
         catalogo.registrar_resultado(e.pasta, item, nome, "nao_testavel", motivo, fonte="suite")
 
 
+def _detalhes_das_sondas(detalhes: list[str]) -> list[str]:
+    """As linhas de 'Detalhe das falhas' dos blocos das sondas (o complemento do que
+    `sondas.separar_blocos` deixa na parte da MAW)."""
+    out, dentro = [], False
+    for linha in detalhes:
+        m = _RX_DETALHE_CABECALHO.match(linha)
+        if m:
+            dentro = sondas.e_sonda(m.group(1))
+        if dentro:
+            out.append(linha)
+    return out
+
+
+def _motivos_sondas_ausentes(e: estado.Estado, alvo: str) -> dict[str, str]:
+    """Por que cada sonda não rodou neste alvo (nome da sonda → motivo), pelo `sondas.json` da sprint:
+    gravado pelo `compilar` (com `ausentes`) ou pelo `sondas injetar` (só `puladas`/`erro`)."""
+    info = (_ler_json(e.pasta / "sondas.json", {}) or {}).get(alvo) or {}
+    if "ausentes" in info:
+        return dict(info["ausentes"] or {})
+    arquivos = {a.name: a for a in sondas.listar()}
+    if info.get("erro"):
+        return {n: f"sondas não injetadas em {alvo}: {info['erro']}" for a in arquivos.values()
+                for n in _nomes_das_sondas(a)}
+    return {n: f"sonda pulada em {alvo}: {motivo}" for arq, motivo in (info.get("puladas") or {}).items()
+            if arq in arquivos for n in _nomes_das_sondas(arquivos[arq])}
+
+
 def _suite_de_um_alvo(e: estado.Estado, a: dict, itens: list[dict], env: dict[str, str]) -> dict:
     nome = a["nome"]
     passo = f"suite:{nome}"
@@ -693,13 +1125,33 @@ def _suite_de_um_alvo(e: estado.Estado, a: dict, itens: list[dict], env: dict[st
         d = r.como_dict()
         d["assercoes"] = [redacao.redigir(x) for x in saude.assercoes(saude.filtrar(cap.mensagens))]
         d["captura_erro"] = cap.erro
-        sandbox.escrever_json(e.pasta / "suites" / f"{nome}.json", d)
-        for i, ach in enumerate(achados_da_suite(a, d)):
+        # os blocos "SONDA ..." são do agente: nunca contam contra a suíte existente da MAW
+        da_maw, blocos_sondas = sondas.separar_blocos(d)
+        if blocos_sondas:
+            da_maw["sondas"] = {"blocos": blocos_sondas, "total_ok": sum(b["ok"] for b in blocos_sondas),
+                                "total_falhas": sum(b["falhas"] for b in blocos_sondas),
+                                "detalhes": _detalhes_das_sondas(d.get("detalhes", []))}
+        sandbox.escrever_json(e.pasta / "suites" / f"{nome}.json", da_maw)
+        for i, ach in enumerate(achados_da_suite(a, da_maw)):
             sandbox.escrever_json(e.pasta / "achados-brutos" / f"suite-{nome}-{i:03d}.json", ach)
+        mapa = _mapa_sondas(e)
+        arquivos = {n: arq.name for arq in sondas.listar() for n in _nomes_das_sondas(arq)}
+        injetadas = ((_ler_json(e.pasta / "sondas.json", {}) or {}).get(nome) or {}).get("injetadas")
+        if da_maw.get("incoerencias") and (blocos_sondas or injetadas):
+            _acrescentar_limitacoes(e, "sondas", [
+                f"a suíte de {nome} ficou incoerente com as sondas do agente injetadas: o relatório não permite "
+                "separar se a causa é da MAW ou de uma sonda"])
+        for i, ach in enumerate(achados_das_sondas(a, blocos_sondas, d.get("detalhes", []), mapa, arquivos)):
+            sandbox.escrever_json(e.pasta / "achados-brutos" / f"sonda-{nome}-{i:03d}.json", ach)
+        _acrescentar_limitacoes(e, "sondas", sorted({
+            f"sonda '{b['nome']}' falhou em {nome} e não está no mapa de itens das sondas: o achado ficou em "
+            "saude/geral" for b in blocos_sondas if b["falhas"] and b["nome"] not in mapa}))
         catalogo.registrar_resultado(e.pasta, "saude/suite-existente", nome,
-                                     "passou" if r.passou and not d["assercoes"] else "falhou", fonte="suite")
+                                     "passou" if da_maw["passou"] and not d["assercoes"] else "falhou", fonte="suite")
         cobertas = COBRIVEIS_NO_M1 if benchmark_ok else ("suite",)
-        for item, (res, motivo) in resultados_suite_por_item(itens, d["blocos"], cobertas).items():
+        # todos os blocos (da MAW e das sondas): um item pode citar os dois
+        for item, (res, motivo) in resultados_suite_por_item(itens, d["blocos"], cobertas,
+                                                             _motivos_sondas_ausentes(e, nome)).items():
             catalogo.registrar_resultado(e.pasta, item, nome, res, motivo, fonte="suite")
     else:
         _registrar_suite_nao_rodou(e, nome, itens, _MOTIVO_BUILD.format(cfg="Debug"))
@@ -734,7 +1186,8 @@ def _rodar_suites(e: estado.Estado, pendentes: list[dict], itens: list[dict],
 
 def _suite(args) -> int:
     e = _sprint_atual()
-    itens = _itens_catalogo()
+    # itens cobertos por sonda citam o bloco dela mesmo que o catálogo ainda não o tenha
+    itens = itens_com_sondas(_itens_catalogo(), _mapa_sondas(e))
     todos = _alvos(e)
     pendentes = [a for a in _alvos(e, args.alvo)
                  if not a["compartilha_com"] and not e.feito(f"suite:{a['nome']}")]
@@ -742,24 +1195,34 @@ def _suite(args) -> int:
     ok = True
     if pendentes:
         recusa = None
-        if suite.maw_aberta():
-            recusa = _MOTIVO_MAW_ABERTA  # e o %APPDATA%\MAW nem é tocado
-        else:
-            _restaurar_pendentes(e)
-            sujas = _pastas_com_pendencia()
-            if sujas:  # em qualquer sprint: a suíte nunca faz backup de um ambiente já sujo
-                recusa = (f"restauração pendente do %APPDATA%\\MAW ({', '.join(p.name for p in sujas)}) não "
-                          "foi concluída: a suíte não roda sobre um ambiente sujo")
-        backup = None
-        if recusa is None:
-            try:
-                backup = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
-            except OSError as ex:  # sem backup, a MAW não roda
-                recusa = f"não foi possível fazer o backup do %APPDATA%\\MAW: {ex}"
-        if backup is not None:
-            saida["suites"], restauracao = _rodar_suites(e, pendentes, itens, backup)
-            saida["ambiente_restaurado"] = restauracao["verificado"]
-            ok = restauracao["verificado"]
+        # a trava do %APPDATA%\\MAW do começo ao fim (backup → roda → restaura): nenhuma sessão de GUI,
+        # calibração ou restauração de outro processo mexe nele no meio
+        posse = trava_appdata.adquirir(ESPERA_TRAVA_APPDATA)
+        try:
+            if posse is None:
+                recusa = (f"outra sessão do agente usou a MAW por mais de {ESPERA_TRAVA_APPDATA:g} s (trava do "
+                          "%APPDATA%\\MAW ocupada): a suíte não rodou")
+            elif suite.maw_aberta():
+                recusa = _MOTIVO_MAW_ABERTA  # e o %APPDATA%\MAW nem é tocado
+            else:
+                restaurar_pendencias_ambiente("sprint suite", e)
+                sujas = pendencias_ambiente()
+                if sujas:  # em qualquer lugar: a suíte nunca faz backup de um ambiente já sujo
+                    recusa = (f"restauração pendente do %APPDATA%\\MAW ({', '.join(map(_descrever_bandeira, sujas))}) "
+                              "não foi concluída: a suíte não roda sobre um ambiente sujo")
+            backup = None
+            if recusa is None:
+                try:
+                    backup = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
+                except OSError as ex:  # sem backup, a MAW não roda
+                    recusa = f"não foi possível fazer o backup do %APPDATA%\\MAW: {ex}"
+            if backup is not None:
+                saida["suites"], restauracao = _rodar_suites(e, pendentes, itens, backup)
+                saida["ambiente_restaurado"] = restauracao["verificado"]
+                ok = restauracao["verificado"]
+        finally:
+            if posse is not None:
+                posse.liberar()
         if recusa is not None:
             for a in pendentes:
                 _registrar_suite_nao_rodou(e, a["nome"], itens, recusa)
@@ -811,13 +1274,13 @@ def cmd_achado(args: argparse.Namespace) -> int:
 
 
 def _cfg_catalogo(p: argparse.ArgumentParser) -> None:
-    p.add_argument("acao", choices=["validar"])
+    p.add_argument("acao", choices=["validar", "rascunho", "publicar"])
+    p.add_argument("rascunho", nargs="?",
+                   help="caminho do rascunho.yaml: destino da cópia ('rascunho', padrão "
+                        "privado/catalogo/funcionalidades.rascunho.yaml) ou arquivo a publicar ('publicar')")
 
 
-@registrar("catalogo", "valida o catálogo de funcionalidades", _cfg_catalogo)
-def cmd_catalogo(args: argparse.Namespace) -> int:
-    itens = catalogo.carregar(config.CATALOGO)
-    princ = catalogo.carregar(config.PRINCIPIOS) if config.PRINCIPIOS.exists() else []
+def _validar_catalogo_completo(itens: list[dict], princ: list[dict]) -> list[str]:
     erros = catalogo.validar(itens)
     ids = {i["id"] for i in itens}
     for p in princ:
@@ -826,6 +1289,45 @@ def cmd_catalogo(args: argparse.Namespace) -> int:
     for obrig in ("saude/build-release", "saude/build-debug", "saude/suite-existente", "saude/benchmark"):
         if obrig not in ids:
             erros.append(f"item obrigatório ausente: {obrig}")
+    return erros
+
+
+@registrar("catalogo", "valida ou publica o catálogo de funcionalidades", _cfg_catalogo)
+def cmd_catalogo(args: argparse.Namespace) -> int:
+    princ = catalogo.carregar(config.PRINCIPIOS) if config.PRINCIPIOS.exists() else []
+    if args.acao == "rascunho":
+        # o ponto de partida do catalogador: cópia do catálogo publicado, feita pelo sandbox (sem `cp`,
+        # que a execução noturna não libera)
+        destino = Path(args.rascunho) if args.rascunho else config.CATALOGO.with_name("funcionalidades.rascunho.yaml")
+        sandbox.escrever_texto(destino, config.CATALOGO.read_text(encoding="utf-8"))
+        return _saida({"ok": True, "rascunho": str(destino)})
+    if args.acao == "publicar":
+        if not args.rascunho:
+            return _saida({"ok": False, "erros": ["informe o caminho do rascunho.yaml"]}, False)
+        rascunho = Path(args.rascunho)
+        if not rascunho.exists():
+            return _saida({"ok": False, "erros": [f"rascunho não encontrado: {rascunho}"]}, False)
+        try:
+            itens = catalogo.carregar(rascunho)
+        except yaml.YAMLError as ex:
+            return _saida({"ok": False, "erros": [f"YAML inválido em {rascunho}: {ex}"]}, False)
+        erros = _validar_catalogo_completo(itens, princ)
+        if config.CATALOGO.exists():  # o catálogo só cresce: um rascunho parcial não apaga itens publicados
+            publicado = catalogo.carregar(config.CATALOGO)
+            atuais = ({i["id"] for i in publicado if isinstance(i, dict) and i.get("id")}
+                      if isinstance(publicado, list) else set())
+            sumidos = sorted(atuais - {i.get("id") for i in itens})
+            if sumidos:
+                erros.append(f"o rascunho perde {len(sumidos)} item(ns) já publicado(s): "
+                             f"{', '.join(sumidos[:20])}{' …' if len(sumidos) > 20 else ''}")
+        if erros:
+            return _saida({"ok": False, "erros": erros}, False)
+        # troca atômica: só grava depois de validar tudo, e sandbox.escrever_texto já
+        # escreve num .tmp e faz os.replace por cima do arquivo final.
+        sandbox.escrever_texto(config.CATALOGO, rascunho.read_text(encoding="utf-8"))
+        return _saida({"ok": True, "itens": len(itens), "publicado": str(config.CATALOGO)})
+    itens = catalogo.carregar(config.CATALOGO)
+    erros = _validar_catalogo_completo(itens, princ)
     return _saida({"itens": len(itens), "principios": len(princ), "erros": erros}, not erros)
 
 
@@ -851,9 +1353,7 @@ def _consolidar(args) -> int:
                                                    extras=[("automatico", derivadas)])
     sandbox.escrever_json(e.pasta / "reverificacoes.json", rever)
     sandbox.escrever_json(e.pasta / "erros_agente.json", erros_leitura + invalidos + conflitos_rever)
-    for a in brutos:
-        if (a.get("veredito") or {}).get("resultado") == "provavel":
-            a["confianca"] = "provavel"
+    # a promoção/rebaixamento de confiança pelo veredito já aconteceu em ler_brutos (spec §11.3)
     derrubados = [{"titulo": a["titulo"], "justificativa": a["veredito"].get("justificativa", "")}
                   for a in brutos if (a.get("veredito") or {}).get("resultado") == "derrubado"]
     lista, hist = achados.consolidar(brutos, hist_antes, f"{e.numero:02d}", rever)
@@ -886,7 +1386,8 @@ def _encerrar(args) -> int:
         return _saida({**info, "retomado": True},
                       bool(info.get("verificado")) and bool(info.get("ambiente_restaurado")))
     e.iniciar("encerrar")
-    _restaurar_pendentes(e)  # caso uma suíte tenha caído sem restaurar (adiada se a MAW estiver aberta)
+    # caso algo tenha caído sem restaurar, em qualquer lugar (adiada se a MAW estiver aberta)
+    restaurar_pendencias_ambiente("sprint encerrar", e)
     antes = _ler_json(e.pasta / "prova-antes.json")
     depois = alvos.prova_intocada(config.pastas_protegidas())
     sandbox.escrever_json(e.pasta / "prova-depois.json", depois)
