@@ -1,0 +1,4 @@
+#!/bin/sh
+# Hook do repositório PÚBLICO: bloqueia resultado, segredo e termo interno da MAW.
+raiz="$(git rev-parse --show-toplevel)"
+exec "$raiz/.venv/Scripts/python.exe" -m maw_agent hook-precommit --repo publico
