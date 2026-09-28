@@ -9,9 +9,9 @@ from pathlib import Path
 from . import config, redacao
 from .cli import registrar
 
-PREFIXOS_PUBLICO = ("privado/", "work/", ".venv/")
-PARTES_PROIBIDAS_PUBLICO = ("relatorios/", "evidencias/")
-PARTES_PROIBIDAS_PRIVADO = ("/evidencias/", "appdata-backup/", "work/")
+PREFIXOS_PUBLICO = ("privado", "work", ".venv")
+SEGMENTOS_PROIBIDOS_PUBLICO = ("relatorios", "evidencias")
+SEGMENTOS_PROIBIDOS_PRIVADO = ("evidencias", "appdata-backup", "work")
 NOMES_PROIBIDOS = ("gemini_api_key.txt", "MAW.settings", "estado.json")
 EXT_PROIBIDAS_PUBLICO = (".pdf", ".wav", ".flac", ".ogg", ".mp3", ".maw", ".settings")
 
@@ -49,12 +49,23 @@ def verificar(arquivos: dict[str, str], repo: str, termos: list[str] | None) -> 
             violacoes.append(f"{c}: arquivo que nunca vai para repositório")
             continue
         if repo == "publico":
-            if c.startswith(PREFIXOS_PUBLICO) or any(p in c for p in PARTES_PROIBIDAS_PUBLICO) \
-                    or c.lower().endswith(EXT_PROIBIDAS_PUBLICO):
+            segmentos = c.split("/")
+            # Refuses if FIRST segment is privado, work, or .venv
+            if segmentos[0] in PREFIXOS_PUBLICO:
+                violacoes.append(f"{c}: caminho proibido no repositório público")
+                continue
+            # Refuses if ANY segment equals relatorios or evidencias
+            if any(seg in SEGMENTOS_PROIBIDOS_PUBLICO for seg in segmentos):
+                violacoes.append(f"{c}: caminho proibido no repositório público")
+                continue
+            # Check forbidden extensions and names
+            if c.lower().endswith(EXT_PROIBIDAS_PUBLICO):
                 violacoes.append(f"{c}: caminho proibido no repositório público")
                 continue
         else:
-            if any(p in "/" + c for p in PARTES_PROIBIDAS_PRIVADO):
+            segmentos = c.split("/")
+            # Refuses if ANY segment equals evidencias, appdata-backup, or work
+            if any(seg in SEGMENTOS_PROIBIDOS_PRIVADO for seg in segmentos):
                 violacoes.append(f"{c}: evidência bruta ou backup não vai nem para o privado")
                 continue
         tipos = redacao.segredos_em(conteudo)

@@ -44,3 +44,22 @@ def test_carregar_termos(tmp_path):
     p.write_text("# comentario\nClasseSecreta\n\nre:X\\d\n", encoding="utf-8")
     assert hook.carregar_termos(p) == ["ClasseSecreta", "re:X\\d"]
     assert hook.carregar_termos(tmp_path / "nao.txt") is None
+
+
+def test_privado_aceita_caminhos_com_word_similar():
+    # network/config.json should be accepted (contains "work" as substring but not as segment)
+    assert hook.verificar({"network/config.json": ""}, "privado", None) == []
+    # framework/x.py should be accepted (doesn't contain forbidden segments)
+    assert hook.verificar({"framework/x.py": ""}, "privado", None) == []
+
+
+def test_publico_aceita_caminhos_com_word_similar():
+    # app/meus-relatorios/notas.txt should be accepted (relatorios not first segment)
+    assert hook.verificar({"app/meus-relatorios/notas.txt": ""}, "publico", TERMOS) == []
+    # docs/homework/x.md should be accepted (no forbidden segments)
+    assert hook.verificar({"docs/homework/x.md": ""}, "publico", TERMOS) == []
+
+
+def test_publico_bloqueia_relatorios_como_segmento():
+    # a/relatorios/b.txt should be refused (relatorios is a segment)
+    assert hook.verificar({"a/relatorios/b.txt": ""}, "publico", TERMOS)
