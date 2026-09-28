@@ -375,7 +375,9 @@ def test_reverificacao_automatica_combina_alvos_pelo_mais_conservador(tmp_path):
 # ---------- I6: veredito ausente ou ilegível ----------
 
 def test_ler_brutos_vereditos(tmp_path):
-    bruto = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
+    # achado de julgamento (de subagente): sem veredito legível cai para provável
+    bruto = dict(fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"],
+                                              "log": "l.log"}), fonte="testador-motor")
     outro = dict(bruto, assinatura="outra")
     _gravar(tmp_path, "achados-brutos/a.json", bruto)              # sem veredito
     _gravar(tmp_path, "achados-brutos/b.json", [bruto, outro])     # lista de vereditos curta
@@ -415,3 +417,26 @@ def test_conferir_referencias():
     erros = fases.conferir_referencias([dict(a, alvos=[{"alvo": "main", "commit": "b" * 40}])], ids, alvos_)
     assert len(erros) == 1 and "commit" in erros[0]
     assert "alvos.json" in fases.conferir_referencias([a], ids, None)[0]
+
+
+def test_achado_mecanico_de_build_ou_suite_nao_depende_de_veredito(tmp_path):
+    build_ = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
+    suite_ = fases.achados_da_suite(ALVO, {"blocos": [{"nome": "Bloco B", "sub": "y", "ok": 0, "falhas": 1}],
+                                           "detalhes": [], "incoerencias": [], "assercoes": []})[0]
+    julgamento = dict(suite_, fonte="testador-motor", assinatura="Source/a.cpp::f::condicao")
+    _gravar(tmp_path, "achados-brutos/suite-main-000.json", suite_)          # sem veredito
+    _gravar(tmp_path, "achados-brutos/build-main-Release.json", build_)      # veredito ilegível
+    (tmp_path / "vereditos").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "vereditos" / "build-main-Release.json").write_text("{quebrado", encoding="utf-8")
+    _gravar(tmp_path, "achados-brutos/suite-main-001.json", dict(suite_, assinatura="suite:Bloco C|z"))
+    _gravar(tmp_path, "vereditos/suite-main-001.json", {"resultado": "derrubado", "justificativa": "x"})
+    _gravar(tmp_path, "achados-brutos/testador-motor-main-001.json", julgamento)  # sem veredito
+    entradas, sem_verificacao, msgs = fases.ler_brutos(tmp_path)
+    por_origem = {o: a for o, a in entradas}
+    assert por_origem["suite-main-000.json[0]"]["confianca"] == "confirmado"
+    assert por_origem["build-main-Release.json[0]"]["confianca"] == "confirmado"
+    assert por_origem["suite-main-001.json[0]"]["veredito"]["resultado"] == "derrubado"  # veredito vale igual
+    assert por_origem["testador-motor-main-001.json[0]"]["confianca"] == "provavel"
+    sem = {o for o, a in entradas if id(a) in sem_verificacao}
+    assert sem == {"testador-motor-main-001.json[0]"}
+    assert any("build-main-Release.json" in m for m in msgs)  # o veredito ilegível continua declarado

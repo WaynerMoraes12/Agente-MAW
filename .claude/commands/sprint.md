@@ -52,7 +52,7 @@ Quando a compilação terminar: `MA sprint suite` (em segundo plano). Ela só ro
 1. **Espere a suíte (fase 4) e TODOS os subagentes da fase 3 terminarem** antes de listar `achados-brutos/`. Quando os dois acabarem: `MA sprint marcar executar`.
 2. Liste `achados-brutos/*.json`. Na retomada, pule os que já têm `vereditos/<mesmo nome>`.
 3. Agrupe por arquivo e despache `advogado-do-diabo` (até 6 em paralelo, cada um com até 8 arquivos e a pasta da sprint). Cada um grava `<pasta da sprint>/vereditos/<nome exato do arquivo bruto>` — o mesmo nome, com a mesma extensão.
-4. Quando todos terminarem: `MA sprint marcar verificar`. Achado sem veredito legível entra no PDF como provável e é declarado nas limitações.
+4. Quando todos terminarem: `MA sprint marcar verificar`. Achado de subagente sem veredito legível entra no PDF como provável e é declarado nas limitações; achado de build/suíte sem veredito mantém a confiança (a evidência é a saída da ferramenta).
 
 ## 6. Consolidar
 `MA sprint consolidar`. Pode rodar de novo sem efeito colateral (parte sempre do histórico de antes da sprint).

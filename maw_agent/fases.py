@@ -304,15 +304,19 @@ def separar_validos(brutos: list[tuple[str, dict]]) -> tuple[list[dict], list[st
 
 
 _RESULTADOS_VEREDITO = ("confirmado", "provavel", "derrubado")
+# achados mecânicos: a evidência é a saída da ferramenta, não um julgamento
+FONTES_MECANICAS = ("build", "suite")
 
 
 def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]]:
     """Lê `achados-brutos/` e casa cada achado com seu veredito em `vereditos/<mesmo nome>`.
 
-    Achado sem veredito legível (ausente, JSON inválido, lista mais curta, objeto sem `resultado`
-    válido) entra com `confianca: provavel` e `veredito: null`, e seu id() vai para o segundo retorno
-    (o contador "sem verificação adversarial"). Veredito ilegível e achado bruto ilegível viram
-    mensagens para `erros_agente.json`. Nunca levanta exceção por conteúdo ruim."""
+    Achado de julgamento (de subagente) sem veredito legível (ausente, JSON inválido, lista mais
+    curta, objeto sem `resultado` válido) entra com `confianca: provavel` e `veredito: null`, e seu id()
+    vai para o segundo retorno (o contador "sem verificação adversarial"). Achado mecânico (`fonte`
+    build/suite) sem veredito mantém a confiança e não entra no contador; um veredito presente vale
+    para ele como para qualquer outro (ex.: `derrubado`). Veredito ilegível e achado bruto ilegível
+    viram mensagens para `erros_agente.json`. Nunca levanta exceção por conteúdo ruim."""
     pasta = Path(pasta)
     entradas: list[tuple[str, dict]] = []
     sem_verificacao: set[int] = set()
@@ -353,7 +357,7 @@ def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]
                 else:
                     veredito = vlista[i]
             a["veredito"] = veredito
-            if veredito is None:
+            if veredito is None and a.get("fonte") not in FONTES_MECANICAS:
                 a["confianca"] = "provavel"
                 sem_verificacao.add(id(a))
             entradas.append((origem, a))

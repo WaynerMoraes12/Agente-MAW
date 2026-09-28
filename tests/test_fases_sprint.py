@@ -276,7 +276,8 @@ def test_consolidar_duas_vezes_da_o_mesmo_resultado(sprint):
     e = sprint["estado"]
     sandbox.escrever_json(e.pasta / "achados-brutos" / "suite-main-000.json", _bruto_de_suite())
     sandbox.escrever_json(e.pasta / "vereditos" / "suite-main-000.json", {"resultado": "confirmado"})
-    sandbox.escrever_json(e.pasta / "achados-brutos" / "x-main-001.json", dict(_bruto_de_suite(), assinatura="outra-assinatura"))
+    sandbox.escrever_json(e.pasta / "achados-brutos" / "x-main-001.json",
+                          dict(_bruto_de_suite(), assinatura="outra-assinatura", fonte="testador-motor"))
     (e.pasta / "vereditos" / "x-main-001.json").write_text("{ilegivel", encoding="utf-8")
     fases._consolidar(None)
     primeiro = _ler(e.pasta / "achados.json")
@@ -422,3 +423,17 @@ def test_reverificacoes_escritas_a_mao_antes_da_consolidacao_valem_e_nao_realime
     fases._consolidar(None)
     [b] = _ler(e.pasta / "achados.json")
     assert b == a and _ler(e.pasta / "erros_agente.json") == []
+
+
+def test_bloco_da_suite_falhando_sem_veredito_bloqueia_o_alvo(sprint):
+    from maw_agent.relatorio import contexto
+    e = sprint["estado"]
+    sandbox.escrever_json(e.pasta / "builds" / "main-Release.json", {"ok": True, "segundos": 1, "avisos": []})
+    sandbox.escrever_json(e.pasta / "achados-brutos" / "suite-main-000.json", _bruto_de_suite())  # sem veredito
+    fases._consolidar(None)
+    [a] = _ler(e.pasta / "achados.json")
+    assert a["confianca"] == "confirmado"
+    assert estado.carregar(e.pasta).dados("consolidar")["sem_verificacao_adversarial"] == 0
+    ctx = contexto.montar(e.pasta, ITENS, [], None, None)
+    assert {x["nome"]: x["semaforo"] for x in ctx["alvos"]}["main"] == "bloqueado"
+    assert not any("sem verificação adversarial" in l for l in ctx["limitacoes"])
