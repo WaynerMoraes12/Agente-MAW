@@ -52,18 +52,41 @@ def _portas_midi() -> list[str]:
         return [f"(erro ao listar: {e})"]
 
 
-def _python310() -> str | None:
+def _python310() -> tuple[str | None, str]:
+    """Localiza Python 3.10 e retorna (caminho, detalhe)."""
     uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv.exe")
+    if not Path(uv).exists():
+        return None, "uv não encontrado"
     try:
         p = subprocess.run([uv, "python", "find", "3.10"], capture_output=True, text=True, timeout=30)
-        return p.stdout.strip() or None if p.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip(), p.stdout.strip()
+        return None, "Python 3.10 ausente (uv python install 3.10)"
+    except subprocess.TimeoutExpired:
+        return None, "Python 3.10 ausente (timeout ao procurar)"
+    except OSError:
+        return None, "Python 3.10 ausente (uv python install 3.10)"
 
 
 def _ffmpeg() -> str | None:
     local = config.FERRAMENTAS / "ffmpeg" / "bin" / "ffmpeg.exe"
     return str(local) if local.exists() else shutil.which("ffmpeg")
+
+
+def _msbuild() -> tuple[str | None, str]:
+    """Localiza MSBuild; retorna (caminho, detalhe).
+
+    Trata FileNotFoundError, TimeoutExpired e OSError para nunca quebrar.
+    """
+    try:
+        from .build import localizar_msbuild
+        return str(localizar_msbuild()), str(localizar_msbuild())
+    except FileNotFoundError as e:
+        return None, str(e)
+    except subprocess.TimeoutExpired:
+        return None, "MSBuild não encontrado (timeout ao procurar com vswhere)"
+    except OSError as e:
+        return None, f"Erro ao procurar MSBuild: {e}"
 
 
 def _nao_perturbe() -> bool:
@@ -76,13 +99,32 @@ def _nao_perturbe() -> bool:
         return False
 
 
-def _dpi_e_tela() -> tuple[int, str]:
+def _dpi_e_tela() -> tuple[int, str, int]:
+    """Retorna (dpi, resolucao, escala_percent) com processo DPI aware.
+
+    Tenta ativar DPI awareness para obter valores físicos, não virtualizados.
+    """
     u = ctypes.windll.user32
+    # Tentar ativar DPI awareness (de mais recente para mais antigo)
+    try:
+        u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            try:
+                u.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass  # Falha é ok; já pode estar ativado
+
     try:
         dpi = u.GetDpiForSystem()
     except AttributeError:
         dpi = 96
-    return dpi, f"{u.GetSystemMetrics(0)}x{u.GetSystemMetrics(1)}"
+
+    resolucao = f"{u.GetSystemMetrics(0)}x{u.GetSystemMetrics(1)}"
+    escala = dpi * 100 // 96
+    return dpi, resolucao, escala
 
 
 def verificar_tudo() -> list[Verificacao]:
@@ -91,11 +133,8 @@ def verificar_tudo() -> list[Verificacao]:
     vs.append(Verificacao("maw_fechada", not aberta,
                           "MAW está aberta: feche-a antes da fase de GUI" if aberta else "MAW fechada",
                           False, ["gui"]))
-    try:
-        from .build import localizar_msbuild
-        vs.append(Verificacao("msbuild", True, str(localizar_msbuild()), True, []))
-    except FileNotFoundError as e:
-        vs.append(Verificacao("msbuild", False, str(e), True, []))
+    msb_path, msb_detail = _msbuild()
+    vs.append(Verificacao("msbuild", msb_path is not None, msb_detail, True, []))
     vs.append(Verificacao("edge", EDGE.exists(), str(EDGE) if EDGE.exists() else "Edge não encontrado", True, []))
     livre = shutil.disk_usage(config.RAIZ).free / 1e9
     vs.append(Verificacao("disco", livre >= 30, f"{livre:.0f} GB livres (mínimo 30)", True, []))
@@ -103,8 +142,8 @@ def verificar_tudo() -> list[Verificacao]:
     cabo = any("CABLE" in d.upper() for d in audio)
     vs.append(Verificacao("vb_cable", cabo, "VB-Cable presente" if cabo else "VB-Cable não instalado",
                           False, ["vb-cable"]))
-    py = _python310()
-    vs.append(Verificacao("python310", bool(py), py or "Python 3.10 ausente (uv python install 3.10)",
+    py_path, py_detail = _python310()
+    vs.append(Verificacao("python310", py_path is not None, py_path or py_detail,
                           False, ["python310"]))
     ff = _ffmpeg()
     vs.append(Verificacao("ffmpeg", bool(ff), ff or "ffmpeg ausente", False, ["ffmpeg"]))
@@ -114,8 +153,8 @@ def verificar_tudo() -> list[Verificacao]:
     np_ok = _nao_perturbe()
     vs.append(Verificacao("nao_perturbe", np_ok, "Não perturbe ligado" if np_ok else
                           "Não perturbe desligado: notificações podem roubar o foco da GUI", False, []))
-    dpi, tela = _dpi_e_tela()
-    vs.append(Verificacao("tela", True, f"{tela} a {dpi} dpi ({dpi * 100 // 96}%)", False, []))
+    dpi, tela, escala = _dpi_e_tela()
+    vs.append(Verificacao("tela", True, f"{tela} a {dpi} dpi ({escala}%)", False, []))
     return vs
 
 
@@ -124,12 +163,8 @@ def requisitos_ausentes(vs: list[Verificacao]) -> set[str]:
 
 
 def ambiente() -> dict:
-    dpi, tela = _dpi_e_tela()
-    try:
-        from .build import localizar_msbuild
-        msb = str(localizar_msbuild())
-    except FileNotFoundError:
-        msb = None
+    dpi, tela, escala = _dpi_e_tela()
+    msb_path, _ = _msbuild()
     return {
         "windows": f"{platform.system()} {platform.release()} ({platform.version()})",
         "python": platform.python_version(),
@@ -138,8 +173,9 @@ def ambiente() -> dict:
         "ram_gb": round(psutil.virtual_memory().total / 2**30, 1),
         "dpi": dpi,
         "resolucao": tela,
+        "escala": escala,
         "dispositivos_audio": _dispositivos_audio(),
         "portas_midi": _portas_midi(),
-        "msbuild": msb,
+        "msbuild": msb_path,
         "edge": str(EDGE) if EDGE.exists() else None,
     }
