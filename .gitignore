@@ -1,0 +1,30 @@
+# Repositório PÚBLICO do Agente MAW.
+# Nada daqui para baixo pode chegar ao GitHub público: conhecimento interno
+# da MAW, resultados, evidências e segredos. O hook de pre-commit
+# (ferramentas/hooks/pre-commit) confere de novo no momento do commit.
+
+# Repositório privado (catálogo, cenários, sondas, princípios, achados, PDFs)
+/privado/
+
+# Área de trabalho do agente: espelho da MAW, worktrees, builds, Python 3.10,
+# ffmpeg portátil, caches de modelos, backups do %APPDATA%\MAW
+/work/
+
+# Resultados, onde quer que apareçam por engano
+relatorios/
+evidencias/
+*.pdf
+achados*.json
+estado.json
+
+# Segredos
+.env
+*.key
+gemini_api_key.txt
+MAW.settings
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
