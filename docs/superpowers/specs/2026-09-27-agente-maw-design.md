@@ -92,8 +92,8 @@ A garantia é estrutural; não depende de disciplina.
 
 | Onde | O que vai |
 |---|---|
-| **Público** `WaynerMoraes12/Agente-MAW` | `CLAUDE.md` genérico, `/sprint`, subagentes, `maw_agent/` (ferramentas), gerador de PDF, testes do agente, esta spec |
-| **Privado** `WaynerMoraes12/Agente-MAW-privado`, clonado em `privado/` | catálogo, cenários, sondas, princípios com citações, fixtures específicas, apêndice, registro de achados, PDFs |
+| **Público** `WaynerMoraes12/Roadie` | `CLAUDE.md` genérico, `/sprint`, subagentes, `maw_agent/` (ferramentas), gerador de PDF, testes do agente, esta spec |
+| **Privado** `WaynerMoraes12/Roadie-privado`, clonado em `privado/` | catálogo, cenários, sondas, princípios com citações, fixtures específicas, apêndice, registro de achados, PDFs |
 | **Nenhum repositório** | backups do `%APPDATA%\MAW`, chave do Gemini, evidências brutas, `work/` |
 
 A MAW é privada, e por isso o conhecimento interno dela não vai para o
