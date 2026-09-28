@@ -62,3 +62,34 @@ def test_restauracao_de_origem_que_nao_existia(tmp_path):
     origem.mkdir(); (origem / "a").write_text("x")
     sandbox.restaurar_pasta(bk)
     assert not origem.exists()
+
+def test_remover_junction_sem_apagar_destino(tmp_path):
+    alvo = tmp_path / "alvo"
+    alvo.mkdir()
+    (alvo / "arquivo.txt").write_text("conteudo")
+
+    ponte = tmp_path / "ponte"
+    os.system(f'mklink /J "{ponte}" "{alvo}" >NUL')
+    if not ponte.exists():
+        pytest.skip("mklink /J indisponível")
+
+    sandbox.remover(ponte)
+    assert not ponte.exists(), "junction deve ser removida"
+    assert alvo.exists(), "alvo deve continuar existindo"
+    assert (alvo / "arquivo.txt").read_text() == "conteudo", "conteudo do alvo deve estar intacto"
+
+def test_restauracao_falha_se_manifesto_corrompido(tmp_path):
+    origem = tmp_path / "AppData" / "MAW"
+    (origem / "config").mkdir(parents=True)
+    (origem / "config" / "settings.json").write_text('{"a": 1}')
+    bk = sandbox.backup_pasta(origem, tmp_path / "bk")
+
+    # Corrompe o arquivo no backup depois do manifesto ser escrito
+    (bk / "dados" / "config" / "settings.json").write_text('{"b": 2}')
+
+    # Prepara uma nova origem para restauracao (remove o conteudo antigo)
+    import shutil
+    shutil.rmtree(origem)
+
+    with pytest.raises(sandbox.RestauracaoFalhou):
+        sandbox.restaurar_pasta(bk)

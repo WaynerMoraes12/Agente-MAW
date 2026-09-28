@@ -23,7 +23,7 @@ class RestauracaoFalhou(Exception):
 
 
 def _real(p: Path) -> Path:
-    # resolve(strict=False) segue symlinks/junctions das partes que existem
+    # os.path.realpath segue symlinks/junctions das partes que existem
     return Path(os.path.realpath(Path(p).absolute()))
 
 
@@ -77,7 +77,10 @@ def copiar(origem: Path, destino: Path) -> Path:
 def remover(p: Path) -> None:
     garantir_escrita(p)
     p = Path(p)
-    if p.is_dir() and not p.is_symlink():
+    # Junctions: use os.rmdir to remove the link without touching target
+    if os.path.isjunction(p):
+        os.rmdir(p)
+    elif p.is_dir() and not p.is_symlink():
         shutil.rmtree(p)
     elif p.exists() or p.is_symlink():
         p.unlink()
@@ -113,10 +116,15 @@ def backup_pasta(origem: Path, destino_raiz: Path) -> Path:
 def restaurar_pasta(backup: Path) -> None:
     info = json.loads((Path(backup) / "manifesto.json").read_text(encoding="utf-8"))
     origem = Path(info["origem"])
-    if origem.exists():
-        remover(origem)
-    if info["existia"]:
-        copiar(Path(backup) / "dados", origem)
+    try:
+        if origem.exists():
+            remover(origem)
+        if info["existia"]:
+            copiar(Path(backup) / "dados", origem)
+    except EscritaProibida:
+        raise
+    except OSError as e:
+        raise RestauracaoFalhou(f"erro ao restaurar {origem}: {e}") from e
     obtido = manifesto(origem)
     if obtido != info["arquivos"]:
         raise RestauracaoFalhou(f"{origem} não ficou idêntica ao backup {backup}")
