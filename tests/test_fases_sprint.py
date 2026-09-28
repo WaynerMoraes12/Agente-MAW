@@ -371,3 +371,31 @@ def test_registrar_confere_referencias_redige_e_nao_sobrescreve(sprint, tmp_path
     saida = capsys.readouterr().out
     assert "area/inexistente" in saida and "feature/x" in saida
     assert not (e.pasta / "achados-brutos" / ruim.name).exists()
+
+
+def test_backup_que_falha_recusa_a_suite_sem_deixar_copia(sprint, monkeypatch):
+    e = sprint["estado"]
+    sprint["compilado"]("Debug")
+    real = sandbox.copiar
+
+    def copia_quebra(origem, destino):
+        real(origem, destino)
+        raise OSError("disco cheio (simulado)")
+
+    monkeypatch.setattr(sandbox, "copiar", copia_quebra)
+    assert fases._suite(Args()) == 1
+    assert sprint["chamadas"] == [] and not (e.pasta / "appdata-sujo.json").exists()
+    assert not [p for p in config.BACKUPS.rglob("*") if p.is_file()]
+    assert "backup" in _resultados(e)[("saude/suite-existente", "main")]["motivo"]
+
+
+def test_erro_de_disco_durante_a_suite_nao_vira_recusa(sprint, monkeypatch):
+    sprint["compilado"]("Debug")
+
+    def disco(*a, **k):
+        raise OSError("falha de E/S no meio da suíte (simulada)")
+
+    monkeypatch.setattr(suite, "rodar_suite", disco)
+    with pytest.raises(OSError):
+        fases._suite(Args())
+    assert (config.APPDATA_MAW / "MAW.settings").read_text(encoding="utf-8") == "<original/>"

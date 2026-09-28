@@ -127,11 +127,15 @@ def backup_pasta(origem: Path, destino_raiz: Path) -> Path:
         n += 1
         destino = Path(destino_raiz) / f"{time.strftime('%Y%m%d-%H%M%S')}-{n}"
     criar_pasta(destino)
-    existia = origem.exists()
-    if existia:
-        copiar(origem, destino / "dados")
-    escrever_json(destino / "manifesto.json",
-                  {"origem": str(origem), "existia": existia, "arquivos": manifesto(origem)})
+    try:
+        existia = origem.exists()
+        if existia:
+            copiar(origem, destino / "dados")
+        escrever_json(destino / "manifesto.json",
+                      {"origem": str(origem), "existia": existia, "arquivos": manifesto(origem)})
+    except BaseException:
+        remover(destino)  # backup pela metade não serve e pode conter segredos
+        raise
     return destino
 
 

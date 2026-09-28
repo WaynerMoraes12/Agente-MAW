@@ -631,15 +631,15 @@ def _suite_de_um_alvo(e: estado.Estado, a: dict, itens: list[dict], env: dict[st
     return {"alvo": nome, **detalhe}
 
 
-def _rodar_suites(e: estado.Estado, pendentes: list[dict], itens: list[dict]) -> tuple[list[dict], dict]:
-    """backup do %APPDATA%\\MAW → bandeira appdata-sujo.json → roda → restaura e confere → apaga a
-    bandeira → apaga o backup. A pasta de música é listada antes e depois."""
+def _rodar_suites(e: estado.Estado, pendentes: list[dict], itens: list[dict],
+                  backup: Path) -> tuple[list[dict], dict]:
+    """(backup do %APPDATA%\\MAW já feito) → bandeira appdata-sujo.json → roda → restaura e confere →
+    apaga a bandeira → apaga o backup. A pasta de música é listada antes e depois."""
     env = suite.ambiente_com_ffmpeg(dict(os.environ), config.FERRAMENTAS / "ffmpeg" / "bin")
     musica_antes = _arquivos_musica()
-    backup = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
-    sandbox.escrever_json(e.pasta / "appdata-sujo.json", {"backup": str(backup), "desde": _agora()})
     resumo: list[dict] = []
     try:
+        sandbox.escrever_json(e.pasta / "appdata-sujo.json", {"backup": str(backup), "desde": _agora()})
         for a in pendentes:
             resumo.append(_suite_de_um_alvo(e, a, itens, env))
     finally:
@@ -671,15 +671,16 @@ def _suite(args) -> int:
             pendente = _restaurar_pendente(e)
             if pendente and not pendente["verificado"]:
                 recusa = "restauração pendente do %APPDATA%\\MAW falhou: a suíte não roda sobre um ambiente sujo"
+        backup = None
         if recusa is None:
             try:
-                saida["suites"], restauracao = _rodar_suites(e, pendentes, itens)
-                saida["ambiente_restaurado"] = restauracao["verificado"]
-                ok = restauracao["verificado"]
-            except OSError as ex:
-                if (e.pasta / "appdata-sujo.json").exists():
-                    raise  # já rodou algo: o erro não pode ser escondido
+                backup = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
+            except OSError as ex:  # sem backup, a MAW não roda
                 recusa = f"não foi possível fazer o backup do %APPDATA%\\MAW: {ex}"
+        if backup is not None:
+            saida["suites"], restauracao = _rodar_suites(e, pendentes, itens, backup)
+            saida["ambiente_restaurado"] = restauracao["verificado"]
+            ok = restauracao["verificado"]
         if recusa is not None:
             for a in pendentes:
                 _registrar_suite_nao_rodou(e, a["nome"], itens, recusa)
