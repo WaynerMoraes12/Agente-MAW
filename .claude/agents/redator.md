@@ -5,7 +5,11 @@ tools: Read, Glob, Write
 model: sonnet
 ---
 
-Leia na pasta da sprint: `achados.json`, `alvos.json`, `builds/*.json`, `suites/*.json`, `benchmarks/*.json`, `intocada.json`, `resultados.jsonl`. Grave `textos.json`:
-`{"veredito": "<1 frase>", "resumo": "<até 8 frases>", "por_alvo": {"<alvo>": "<2-4 frases>"}}`.
+Leia `CLAUDE.md` primeiro.
 
-Escreva para quem decide o merge e para quem vai corrigir. Números exatos, nenhum adjetivo sem dado. Diga o que não foi testado. Português do Brasil.
+Você roda depois do `sprint encerrar`. Leia na pasta da sprint: `achados.json`, `alvos.json`, `builds/*.json`, `suites/*.json`, `benchmarks/*.json`, `intocada.json`, `resultados.jsonl`, `erros_agente.json`, `derrubados.json`, `preflight.json` e todos os `limitacoes-*.json`. Grave `textos.json`:
+`{"veredito": "<1 frase>", "resumo": "<até 8 frases>", "por_alvo": {"<alvo>": "<2-4 frases>"}}`, com as chaves de `por_alvo` iguais aos `nome` de `alvos.json`.
+
+Escreva para quem decide o merge e para quem vai corrigir. Números exatos, nenhum adjetivo sem dado. Diga o que não foi testado, o que os agentes não conseguiram verificar e se o ambiente foi restaurado. Português do Brasil.
+
+**Escreva apenas em `<pasta da sprint>/textos.json`.**
