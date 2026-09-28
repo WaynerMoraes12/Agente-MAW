@@ -54,3 +54,9 @@ def test_interpreta_benchmark():
     assert [l.trilhas for l in linhas] == [1, 32]
     assert linhas[1].carga_max == 0.75
     assert "Plugin do master descarregado" in cab[0]
+
+def test_timeout_sem_exit_code():
+    """Processo morto pelo timeout: exit_code é None."""
+    r = suite.interpretar_suite(OK, None, 1.0)
+    assert not r.passou
+    assert r.exit_code is None

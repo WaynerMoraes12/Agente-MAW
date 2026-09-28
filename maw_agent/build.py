@@ -32,7 +32,7 @@ def localizar_msbuild() -> Path:
     if vswhere.exists():
         p = subprocess.run([str(vswhere), "-latest", "-products", "*", "-requires",
                             "Microsoft.Component.MSBuild", "-find", r"MSBuild\**\Bin\MSBuild.exe"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=60)
         for linha in p.stdout.splitlines():
             if linha.strip() and Path(linha.strip()).exists():
                 return Path(linha.strip())
@@ -69,8 +69,9 @@ def compilar(alvo: str, worktree: Path, config: str, pasta_logs: Path,
         saida, codigo = p.stdout + p.stderr, p.returncode
     except subprocess.TimeoutExpired as e:
         saida, codigo = f"{e.stdout or ''}\nTIMEOUT depois de {timeout}s", -1
+    saida = redacao.redigir(saida)
     segundos = round(time.monotonic() - inicio, 1)
-    sandbox.escrever_texto(log, redacao.redigir(saida))
+    sandbox.escrever_texto(log, saida)
     avisos, erros = extrair_diagnosticos(saida)
     exe = caminho_exe(worktree, config)
     ok = codigo == 0 and exe.exists()

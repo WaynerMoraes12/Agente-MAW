@@ -109,7 +109,7 @@ def interpretar_suite(texto: str, exit_code: int | None, segundos: float) -> Res
         if sum(b.ok for b in r.blocos) != r.total_ok or sum(b.falhas for b in r.blocos) != r.total_falhas:
             r.incoerencias.append("a soma dos blocos não bate com os totais declarados")
         if len(r.blocos) != r.blocos_declarados:
-            r.incoerencias.append("o número de blocos listados não bata com o declarado")
+            r.incoerencias.append("o número de blocos listados não bate com o declarado")
     if r.declarado == "PASSOU" and exit_code not in (0, None):
         r.incoerencias.append(f"relatório diz TUDO PASSOU mas o código de saída foi {exit_code}")
     if r.declarado == "FALHOU" and exit_code == 0:
@@ -145,7 +145,7 @@ def executar(exe: Path, argumento: str, cwd: Path, timeout: int) -> tuple[int | 
                            encoding="utf-8", errors="replace", timeout=timeout)
         codigo, saida = p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
-        saida_parcial = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        saida_parcial = e.stdout or ""
         codigo, saida = None, f"{saida_parcial}\nTIMEOUT depois de {timeout}s"
     return codigo, redacao.redigir(saida), round(time.monotonic() - inicio, 1)
 
