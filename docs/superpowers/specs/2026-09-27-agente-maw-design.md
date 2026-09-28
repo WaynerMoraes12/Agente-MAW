@@ -71,8 +71,11 @@ A garantia é estrutural; não depende de disciplina.
   sondas ao projeto de build) acontecem **só** em `work/`.
 - As pastas da MAW do usuário (`C:\Users\User\MAW*`) são **apenas lidas**.
   Commits de um clone local que ainda não estão no GitHub são puxados **a
-  partir** do clone, o que só lê a origem. Nenhum comando git roda dentro
-  delas.
+  partir** do clone, o que só lê a origem. Dentro delas só rodam comandos git
+  de leitura (`rev-parse`, `status`, `diff`), sempre com
+  `--no-optional-locks`, para que nem o índice seja atualizado.
+- Alterações **não commitadas** num clone local não são testadas; o PDF avisa
+  que elas existem.
 - `maw_agent/sandbox.py` expõe a única função de escrita em disco usada pelo
   agente, e ela **recusa** qualquer caminho sob as pastas da MAW do usuário.
   Esse comportamento tem teste próprio.
@@ -135,12 +138,25 @@ repositório público.
                4e revisão de código pelos subagentes especialistas + guardião da ideia
 5. Verificar   o advogado-do-diabo tenta derrubar cada achado
 6. Consolidar  deduplica entre alvos, atribui IDs estáveis, compara com a sprint anterior
-7. Relatório   gera o PDF, com achados.json anexado
-8. Encerrar    restaura o ambiente, registra a prova "depois", compara as duas
+7. Encerrar    restaura o ambiente, registra a prova "depois", compara as duas
+8. Relatório   gera o PDF (que já traz a prova de intocada), com achados.json anexado;
+               a sprint só conta como concluída quando o PDF existe
 ```
 
 As fases 2 e 4e rodam em paralelo; a 4c roda em série, porque a GUI tem um
-mouse só. Cada fase grava seu progresso em `estado.json`, e `/sprint
+mouse só.
+
+**Descoberta de alvos:**
+- `origin/main`;
+- cada branch do GitHub que não é ancestral do `origin/main`;
+- o HEAD de cada clone local que não está mesclado (o mais novo vence quando
+  local e GitHub têm a mesma branch; os dois entram quando divergem).
+
+**Mesma árvore, mesma execução:** dois alvos com a mesma árvore nos caminhos
+de código (por exemplo, uma branch que só muda documentação) compartilham a
+execução, e o PDF declara isso na célula. É o mesmo binário, então rodar de
+novo não traria informação nova. A revisão da documentação continua sendo
+feita por alvo. Cada fase grava seu progresso em `estado.json`, e `/sprint
 --retomar` continua de onde parou (reboot, queda de energia, interrupção).
 
 ### 5.2 Divisão entre ferramentas e subagentes
