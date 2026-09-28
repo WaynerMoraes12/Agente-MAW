@@ -16,6 +16,19 @@ evidencias/
 *.pdf
 achados*.json
 estado.json
+vereditos/
+achados-brutos/
+tmp-*/
+textos.json
+reverificacoes*.json
+resultados.jsonl
+limitacoes-*.json
+appdata-sujo.json
+historico-antes.json
+musica-suite.json
+
+# Configuração local do Claude Code (permissões da máquina, nunca do repositório)
+.claude/settings.local.json
 
 # Segredos
 .env
