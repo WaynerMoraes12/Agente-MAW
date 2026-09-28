@@ -42,15 +42,15 @@ def renderizar(ctx: dict, destino: Path) -> Path:
 
 
 def anexar(pdf: Path, arquivo: Path, nome: str) -> None:
-    # lido para a memória: no Windows um PdfReader sobre o caminho segura o arquivo aberto
+    # lido para a memória: no Windows um PdfReader sobre o caminho segura o arquivo aberto.
+    # O novo PDF também é montado inteiro em memória antes de tocar o disco: escrever_bytes
+    # grava num arquivo temporário e só troca com os.replace no final, então uma falha aqui
+    # nunca apaga o PDF original.
     escritor = PdfWriter(clone_from=PdfReader(io.BytesIO(Path(pdf).read_bytes())))
     escritor.add_attachment(nome, Path(arquivo).read_bytes())
-    tmp = Path(pdf).with_suffix(".tmp.pdf")
-    sandbox.garantir_escrita(tmp)
-    with open(tmp, "wb") as f:
-        escritor.write(f)
-    sandbox.remover(Path(pdf))
-    tmp.rename(pdf)
+    buf = io.BytesIO()
+    escritor.write(buf)
+    sandbox.escrever_bytes(Path(pdf), buf.getvalue())
 
 
 def ler_anexo(pdf: Path, nome: str) -> bytes:

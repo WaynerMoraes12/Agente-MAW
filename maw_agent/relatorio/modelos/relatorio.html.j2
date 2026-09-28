@@ -17,6 +17,9 @@
   <p class="intocada {{ 'ok' if intocada.verificado else 'falha' }}">
     {% if intocada.verificado %}MAW intocada: verificado{% else %}MAW intocada: NÃO verificado — {{ intocada.diferencas | join('; ') }}{% endif %}
   </p>
+  <p class="intocada {{ 'ok' if intocada.ambiente_restaurado else 'falha' }}">
+    {% if intocada.ambiente_restaurado %}Ambiente restaurado: sim{% else %}Ambiente restaurado: NÃO{% if intocada.erro_restauracao %} — {{ intocada.erro_restauracao }}{% endif %}{% endif %}
+  </p>
 </section>
 
 <section>

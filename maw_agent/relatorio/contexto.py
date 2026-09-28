@@ -56,7 +56,11 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
     intocada = _ler(pasta / "intocada.json", {"verificado": False, "diferencas": ["prova não registrada"],
                                               "ambiente_restaurado": False})
     textos = _ler(pasta / "textos.json", {})
+    resumo = textos.get("resumo")
     limitacoes: list[str] = list(alvos_info.get("avisos", []))
+    if not resumo:
+        limitacoes.append("resumo executivo não redigido nesta execução")
+        resumo = ""
     for v in _ler(pasta / "preflight.json", []):
         if not v["ok"]:
             limitacoes.append(f"Pré-voo: {v['detalhe']}")
@@ -70,14 +74,19 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         if b_rel is None:
             limitacoes.append(f"{a['nome']}: build Release não registrado")
         doalvo = [x for x in achados_lista if a["nome"] in {y["alvo"] for y in x["alvos"]}]
-        alvos.append({**a, "semaforo": semaforo(doalvo, build_ok),
-                      "semaforo_rotulo": _ROTULO_SEMAFORO[semaforo(doalvo, build_ok)],
+        sem = semaforo(doalvo, build_ok)
+        texto_alvo = textos.get("por_alvo", {}).get(a["nome"])
+        if not texto_alvo:
+            limitacoes.append(f"texto do alvo {a['nome']} não redigido nesta execução")
+            texto_alvo = ""
+        alvos.append({**a, "semaforo": sem,
+                      "semaforo_rotulo": _ROTULO_SEMAFORO[sem],
                       "build": b_rel, "build_debug": b_dbg,
                       "suite": _ler(pasta / "suites" / f"{origem}.json"),
                       "benchmark": _ler(pasta / "benchmarks" / f"{origem}.json"),
                       "achados_ids": [x["id"] for x in doalvo],
                       "introduzidos": [x["id"] for x in doalvo if x.get("introduzido_por") == a["nome"]],
-                      "texto": textos.get("por_alvo", {}).get(a["nome"], "")})
+                      "texto": texto_alvo})
     resultados = catalogo.carregar_resultados(pasta)
     m = catalogo.montar_matriz(itens, nomes, resultados)
     linhas = [{"item": it["id"], "titulo": it["titulo"], "area": it["area"],
@@ -85,7 +94,7 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
     cobertura = catalogo.resumo(m)
     motivos = Counter(c["motivo"] for l in m.values() for c in l.values() if c["resultado"] == "nao_testavel")
     for motivo, n in motivos.most_common():
-        limitacoes.append(f"{n} célula(s) não testável(is): {motivo}")
+        limitacoes.append(f"{n} célula(s) não testável(is): {motivo or 'motivo não informado'}")
     problemas = [a for a in achados_lista if a["tipo"] != "melhoria"]
     melhorias = [a for a in achados_lista if a["tipo"] == "melhoria"]
     provaveis = [a for a in achados_lista if a.get("confianca") == "provavel"]
@@ -95,7 +104,7 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
     erros_agente = _ler(pasta / "erros_agente.json", [])
     for passo, info in estado.get("passos", {}).items():
         if info.get("status") == "falhou":
-            erros_agente.append(f"passo {passo} falhou: {info.get('erro')}")
+            erros_agente.append(f"passo {passo} falhou: {info.get('erro') or 'sem mensagem de erro'}")
     abertos = [a for a in problemas if a["estado"] in ABERTOS]
     principios_ctx = []
     for p in principios:
@@ -113,7 +122,7 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         "alvos": alvos,
         "avisos_alvos": alvos_info.get("avisos", []),
         "veredito": textos.get("veredito", "Veredito não redigido nesta execução."),
-        "resumo": textos.get("resumo", ""),
+        "resumo": resumo,
         "contagens": {
             "por_severidade": dict(Counter(a.get("severidade") for a in abertos)),
             "por_estado": dict(Counter(a["estado"] for a in achados_lista)),
