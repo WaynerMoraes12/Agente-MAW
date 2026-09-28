@@ -367,10 +367,15 @@ def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]
 def conferir_referencias(lista: list[dict], ids_catalogo: set[str] | None,
                          alvos_sprint: dict[str, str] | None) -> list[str]:
     """Referências de um achado a registrar: item do catálogo existente (quando há catálogo),
-    alvo = um `nome` de alvos.json da sprint e commit = o commit desse alvo."""
+    alvo = um `nome` de alvos.json da sprint e commit = o commit desse alvo. As fontes `build` e
+    `suite` são reservadas: só as fases mecânicas da própria CLI produzem esses achados."""
     erros: list[str] = []
+    for i, a in enumerate(lista):
+        if a.get("fonte") in FONTES_MECANICAS:
+            erros.append(f"achado {i}: fonte '{a['fonte']}' é reservada às fases mecânicas da CLI "
+                         "(`sprint compilar` e `sprint suite`); use o nome do agente que encontrou o achado")
     if alvos_sprint is None:
-        return ["alvos.json da sprint ausente: rode `sprint preparar` antes de registrar achados"]
+        return erros + ["alvos.json da sprint ausente: rode `sprint preparar` antes de registrar achados"]
     for i, a in enumerate(lista):
         item = a.get("item_catalogo")
         if ids_catalogo is not None and item not in ids_catalogo:
@@ -404,17 +409,29 @@ def _restaurar_ambiente(e: estado.Estado, backup: Path, quem: str) -> dict:
             reg["backup_apagado"] = True
         except OSError as ex:
             reg["erro_ao_apagar"] = redacao.redigir(str(ex))
+        _retirar_limitacao(e, "ambiente", _MOTIVO_ADIADA)  # se tinha sido adiada, não está mais
     e.registrar_restauracao(reg)
     return reg
 
 
-def _restaurar_pendente(e: estado.Estado) -> dict | None:
-    """Se uma execução anterior caiu com o %APPDATA%\\MAW sujo (appdata-sujo.json), restaura agora."""
-    sujo = e.pasta / "appdata-sujo.json"
-    if not sujo.exists():
-        return None
+_MOTIVO_ADIADA = ("restauração do %APPDATA%\\MAW adiada: MAW aberta — feche a MAW e rode "
+                  "`sprint iniciar` de novo")
+
+
+def _pastas_com_pendencia() -> list[Path]:
+    """Pastas de sprint com appdata-sujo.json, da mais antiga para a mais nova."""
+    return [p for p in estado._existentes(config.RELATORIOS)
+            if (p / "appdata-sujo.json").exists() and (p / "estado.json").exists()]
+
+
+def _backup_da_bandeira(pasta: Path) -> Path:
+    return Path(json.loads((pasta / "appdata-sujo.json").read_text(encoding="utf-8"))["backup"])
+
+
+def _restaurar_pendente(e: estado.Estado) -> dict:
+    """Restaura o %APPDATA%\\MAW do backup citado na bandeira appdata-sujo.json da sprint `e`."""
     try:
-        backup = Path(json.loads(sujo.read_text(encoding="utf-8"))["backup"])
+        backup = _backup_da_bandeira(e.pasta)
     except (OSError, ValueError, KeyError, TypeError) as ex:
         reg = {"quem": "retomada", "backup": None, "verificado": False, "backup_apagado": False,
                "erro": f"appdata-sujo.json ilegível: {ex}"}
@@ -423,27 +440,76 @@ def _restaurar_pendente(e: estado.Estado) -> dict | None:
     return _restaurar_ambiente(e, backup, "retomada")
 
 
-def _restaurar_pendentes() -> list[dict]:
+def _restaurar_pendentes(atual: estado.Estado | None = None) -> list[dict]:
+    """Restaura o %APPDATA%\\MAW deixado sujo por execuções que caíram (appdata-sujo.json).
+
+    - MAW do usuário aberta: não restaura nada (ela gravaria por cima, ao salvar, as configurações que
+      tem na memória); bandeiras e backups ficam, e o adiamento vai para o estado e para as limitações.
+    - Várias sprints pendentes: só o backup da MAIS ANTIGA é restaurado, porque é o único tirado antes
+      de o agente sujar o ambiente (um backup mais novo pode ter copiado um estado já sujo). Só depois
+      da restauração verificada as pendências mais novas são descartadas (bandeira e backup apagados);
+      se ela falhar, as mais novas ficam intocadas.
+
+    `atual` é o estado que o chamador tem em mãos: é ele que recebe o registro da sua própria pasta
+    (outra instância seria sobrescrita quando o chamador salvasse)."""
+    def carregar(pasta: Path) -> estado.Estado:
+        if atual is not None and Path(atual.pasta).resolve() == Path(pasta).resolve():
+            return atual
+        return estado.carregar(pasta)
+
+    pastas = _pastas_com_pendencia()
+    if not pastas:
+        return []
     out = []
-    for pasta in estado._existentes(config.RELATORIOS):
-        if (pasta / "appdata-sujo.json").exists() and (pasta / "estado.json").exists():
-            reg = _restaurar_pendente(estado.carregar(pasta))
-            if reg:
-                out.append({"sprint": pasta.name, **reg})
+    if suite.maw_aberta():
+        for pasta in pastas:
+            e = carregar(pasta)
+            try:
+                backup = str(_backup_da_bandeira(pasta))
+            except (OSError, ValueError, KeyError, TypeError):
+                backup = None
+            reg = {"quem": "retomada", "backup": backup, "verificado": False, "backup_apagado": False,
+                   "adiada": True, "erro": _MOTIVO_ADIADA}
+            e.registrar_restauracao(reg)
+            _acrescentar_limitacoes(e, "ambiente", [_MOTIVO_ADIADA])
+            out.append({"sprint": pasta.name, **reg})
+        return out
+    mais_antiga, *mais_novas = pastas
+    reg = _restaurar_pendente(carregar(mais_antiga))
+    out.append({"sprint": mais_antiga.name, **reg})
+    if not reg["verificado"]:
+        return out
+    for pasta in mais_novas:
+        e = carregar(pasta)
+        descarte = {"quem": "retomada", "backup": None, "verificado": True, "backup_apagado": False,
+                    "descartado": f"o backup mais antigo, de {mais_antiga.name}, é o estado original e já foi "
+                                  "restaurado; este backup, mais novo, foi apagado sem ser restaurado"}
+        try:
+            backup = _backup_da_bandeira(pasta)
+            descarte["backup"] = str(backup)
+            sandbox.descartar_backup(backup)
+            descarte["backup_apagado"] = True
+        except (OSError, ValueError, KeyError, TypeError) as ex:
+            descarte["erro_ao_apagar"] = redacao.redigir(str(ex))
+        sandbox.remover(pasta / "appdata-sujo.json")
+        _retirar_limitacao(e, "ambiente", _MOTIVO_ADIADA)
+        e.registrar_restauracao(descarte)
+        out.append({"sprint": pasta.name, **descarte})
     return out
 
 
 def _situacao_do_ambiente(e: estado.Estado) -> tuple[bool, str | None]:
-    """Restaurado = nenhuma bandeira pendente e a última restauração de cada backup verificada."""
-    erros = []
-    if (e.pasta / "appdata-sujo.json").exists():
-        erros.append("restauração do %APPDATA%\\MAW pendente (appdata-sujo.json)")
+    """Restaurado = nenhuma bandeira pendente (em nenhuma sprint) e a última restauração de cada
+    backup desta sprint verificada."""
+    erros = [f"restauração do %APPDATA%\\MAW pendente ({p.name}/appdata-sujo.json)" for p in _pastas_com_pendencia()]
     ultima: dict[str, dict] = {}
     for r in e.restauracoes:
         ultima[str(r.get("backup"))] = r
-    erros += [f"restauração de {b} falhou: {r.get('erro') or 'sem mensagem de erro'}"
-              for b, r in ultima.items() if not r.get("verificado")]
-    return (not erros, "; ".join(erros) or None)
+    for b, r in ultima.items():
+        if not r.get("verificado"):
+            erros.append(r["erro"] if r.get("adiada") else
+                         f"restauração de {b} falhou: {r.get('erro') or 'sem mensagem de erro'}")
+    return (not erros, "; ".join(dict.fromkeys(erros)) or None)
 
 
 def _arquivos_musica() -> dict[str, list[str]]:
@@ -462,6 +528,13 @@ def _acrescentar_limitacoes(e: estado.Estado, nome: str, linhas: list[str]) -> N
     novas = atuais + [l for l in linhas if l not in atuais]
     if novas != atuais:
         sandbox.escrever_json(p, novas)
+
+
+def _retirar_limitacao(e: estado.Estado, nome: str, linha: str) -> None:
+    p = e.pasta / f"limitacoes-{nome}.json"
+    atuais = _ler_json(p, [])
+    if linha in atuais:
+        sandbox.escrever_json(p, [l for l in atuais if l != linha])
 
 
 # ---------- ações ----------
@@ -672,9 +745,11 @@ def _suite(args) -> int:
         if suite.maw_aberta():
             recusa = _MOTIVO_MAW_ABERTA  # e o %APPDATA%\MAW nem é tocado
         else:
-            pendente = _restaurar_pendente(e)
-            if pendente and not pendente["verificado"]:
-                recusa = "restauração pendente do %APPDATA%\\MAW falhou: a suíte não roda sobre um ambiente sujo"
+            _restaurar_pendentes(e)
+            sujas = _pastas_com_pendencia()
+            if sujas:  # em qualquer sprint: a suíte nunca faz backup de um ambiente já sujo
+                recusa = (f"restauração pendente do %APPDATA%\\MAW ({', '.join(p.name for p in sujas)}) não "
+                          "foi concluída: a suíte não roda sobre um ambiente sujo")
         backup = None
         if recusa is None:
             try:
@@ -811,7 +886,7 @@ def _encerrar(args) -> int:
         return _saida({**info, "retomado": True},
                       bool(info.get("verificado")) and bool(info.get("ambiente_restaurado")))
     e.iniciar("encerrar")
-    _restaurar_pendente(e)  # caso uma suíte tenha caído sem restaurar
+    _restaurar_pendentes(e)  # caso uma suíte tenha caído sem restaurar (adiada se a MAW estiver aberta)
     antes = _ler_json(e.pasta / "prova-antes.json")
     depois = alvos.prova_intocada(config.pastas_protegidas())
     sandbox.escrever_json(e.pasta / "prova-depois.json", depois)

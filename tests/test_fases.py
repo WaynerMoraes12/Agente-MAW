@@ -405,7 +405,8 @@ def test_ler_brutos_vereditos(tmp_path):
 # ---------- I9: referências do achado ----------
 
 def test_conferir_referencias():
-    a = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
+    a = dict(fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"],
+                                          "log": "l.log"}), fonte="testador-motor")
     ids = {"saude/build-release"}
     alvos_ = {"main": "a" * 40}
     assert fases.conferir_referencias([a], ids, alvos_) == []
@@ -440,3 +441,11 @@ def test_achado_mecanico_de_build_ou_suite_nao_depende_de_veredito(tmp_path):
     sem = {o for o, a in entradas if id(a) in sem_verificacao}
     assert sem == {"testador-motor-main-001.json[0]"}
     assert any("build-main-Release.json" in m for m in msgs)  # o veredito ilegível continua declarado
+
+
+def test_conferir_referencias_recusa_fonte_mecanica():
+    a = fases.achado_de_build(ALVO, {"config": "Release", "erros": ["c.cpp(1): error C2065: x"], "log": "l.log"})
+    for fonte in ("build", "suite"):
+        erros = fases.conferir_referencias([dict(a, fonte=fonte)], {"saude/build-release"}, {"main": "a" * 40})
+        assert len(erros) == 1 and f"'{fonte}'" in erros[0] and "reservada" in erros[0]
+    assert fases.conferir_referencias([dict(a, fonte="suite")], None, None)[0].startswith("achado 0: fonte")

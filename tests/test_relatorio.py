@@ -240,3 +240,19 @@ def test_metodo_usa_o_desfecho_final_de_cada_backup(tmp_path):
         {"quem": "retomada", "backup": "B1", "verificado": True, "backup_apagado": True}])
     [m] = contexto.montar(s, ITENS, [], None, None)["metodo"]
     assert "foi apagado" in m and "1 tentativa(s)" in m and "mantido" not in m
+
+
+def test_metodo_e_limitacao_de_restauracao_adiada_ou_descartada(tmp_path):
+    s = _sprint(tmp_path)
+    motivo = "restauração do %APPDATA%\\MAW adiada: MAW aberta — feche a MAW e rode `sprint iniciar` de novo"
+    (s / "limitacoes-ambiente.json").write_text(json.dumps([motivo]), encoding="utf-8")
+    _estado(s, FASES_OK, restauracoes=[
+        {"quem": "retomada", "backup": "B1", "verificado": False, "adiada": True, "erro": motivo,
+         "backup_apagado": False},
+        {"quem": "retomada", "backup": "B2", "verificado": True, "backup_apagado": True,
+         "descartado": "o backup mais antigo, de sprint-01, é o estado original e já foi restaurado"}])
+    ctx = contexto.montar(s, ITENS, [], None, None)
+    assert motivo in ctx["limitacoes"]  # sem prefixo de agente
+    m1, m2 = ctx["metodo"]
+    assert "B1" in m1 and "adiada" in m1 and "MAW estava aberta" in m1
+    assert "sem ser restaurado" in m2 and "sprint-01" in m2

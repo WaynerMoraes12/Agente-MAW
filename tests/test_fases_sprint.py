@@ -437,3 +437,113 @@ def test_bloco_da_suite_falhando_sem_veredito_bloqueia_o_alvo(sprint):
     ctx = contexto.montar(e.pasta, ITENS, [], None, None)
     assert {x["nome"]: x["semaforo"] for x in ctx["alvos"]}["main"] == "bloqueado"
     assert not any("sem verificação adversarial" in l for l in ctx["limitacoes"])
+
+
+# ---------- correção pontual pós-re-revisão ----------
+
+def _pendencia(e, estado_appdata: str | None = None) -> Path:
+    """Backup do %APPDATA%\\MAW como está agora + bandeira appdata-sujo.json na sprint `e`;
+    depois suja o %APPDATA%\\MAW com `estado_appdata`."""
+    bk = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
+    sandbox.escrever_json(e.pasta / "appdata-sujo.json", {"backup": str(bk), "desde": "2026-09-28T03:00:00"})
+    if estado_appdata is not None:
+        (config.APPDATA_MAW / "MAW.settings").write_text(estado_appdata, encoding="utf-8")
+    return bk
+
+
+def _appdata():
+    return (config.APPDATA_MAW / "MAW.settings").read_text(encoding="utf-8")
+
+
+def test_iniciar_com_a_maw_aberta_adia_a_restauracao(sprint, monkeypatch, capsys):
+    e = sprint["estado"]
+    bk = _pendencia(e, "<sujo/>")
+    monkeypatch.setattr(estado, "em_andamento", lambda raiz=config.RELATORIOS: estado.carregar(e.pasta))
+    monkeypatch.setattr(suite, "maw_aberta", lambda: True)
+    assert main(["sprint", "iniciar"]) == 1
+    saida = json.loads(capsys.readouterr().out)
+    assert saida["restauracoes"][0]["adiada"] is True
+    # nada foi restaurado nem apagado: a bandeira e o único backup bom continuam lá
+    assert _appdata() == "<sujo/>" and (e.pasta / "appdata-sujo.json").exists() and bk.exists()
+    reg = estado.carregar(e.pasta).restauracoes[-1]
+    assert reg["adiada"] is True and reg["verificado"] is False
+    motivo = "restauração do %APPDATA%\\MAW adiada: MAW aberta — feche a MAW e rode `sprint iniciar` de novo"
+    assert reg["erro"] == motivo
+    assert motivo in _ler(e.pasta / "limitacoes-ambiente.json")
+    # a MAW foi fechada: a retomada restaura e a limitação de adiamento sai
+    monkeypatch.setattr(suite, "maw_aberta", lambda: False)
+    assert main(["sprint", "iniciar"]) == 0
+    assert _appdata() == "<original/>" and not (e.pasta / "appdata-sujo.json").exists() and not bk.exists()
+    assert motivo not in _ler(e.pasta / "limitacoes-ambiente.json", )
+
+
+def test_encerrar_com_a_maw_aberta_nao_restaura_e_declara(sprint, monkeypatch):
+    e = sprint["estado"]
+    bk = _pendencia(e, "<sujo/>")
+    sandbox.escrever_json(e.pasta / "prova-antes.json", {"MAW": {"tipo": "git", "head": "h"}})
+    monkeypatch.setattr(fases.alvos, "prova_intocada", lambda pastas: {"MAW": {"tipo": "git", "head": "h"}})
+    monkeypatch.setattr(suite, "maw_aberta", lambda: True)
+    assert fases._encerrar(None) == 1
+    info = _ler(e.pasta / "intocada.json")
+    assert info["ambiente_restaurado"] is False and "adiada: MAW aberta" in info["erro_restauracao"]
+    assert _appdata() == "<sujo/>" and bk.exists() and (e.pasta / "appdata-sujo.json").exists()
+
+
+def test_encerrar_com_a_maw_fechada_restaura_a_pendencia(sprint, monkeypatch):
+    e = sprint["estado"]
+    _pendencia(e, "<sujo/>")
+    sandbox.escrever_json(e.pasta / "prova-antes.json", {"MAW": {"tipo": "git", "head": "h"}})
+    monkeypatch.setattr(fases.alvos, "prova_intocada", lambda pastas: {"MAW": {"tipo": "git", "head": "h"}})
+    assert fases._encerrar(None) == 0
+    assert _appdata() == "<original/>" and _ler(e.pasta / "intocada.json")["ambiente_restaurado"] is True
+
+
+def test_varias_pendencias_restaura_a_mais_antiga_e_descarta_as_novas(sprint):
+    e1 = sprint["estado"]
+    bk1 = _pendencia(e1, "<sujo pela sprint-01/>")        # backup do estado original
+    e2 = estado.nova_sprint(config.RELATORIOS)
+    bk2 = _pendencia(e2, "<sujo pela sprint-02/>")        # backup de um estado já sujo
+    regs = fases._restaurar_pendentes()
+    assert _appdata() == "<original/>"                    # o estado de antes do agente
+    assert not bk1.exists() and not bk2.exists()
+    assert not (e1.pasta / "appdata-sujo.json").exists() and not (e2.pasta / "appdata-sujo.json").exists()
+    assert [r["sprint"] for r in regs] == ["sprint-01", "sprint-02"]
+    r2 = estado.carregar(e2.pasta).restauracoes[-1]
+    assert r2["verificado"] is True and r2["backup_apagado"] is True and "sprint-01" in r2["descartado"]
+
+
+def test_pendencia_mais_antiga_que_falha_nao_deixa_restaurar_a_mais_nova(sprint):
+    e1 = sprint["estado"]
+    sandbox.escrever_json(e1.pasta / "appdata-sujo.json", {"backup": str(config.BACKUPS / "sumiu"), "desde": "x"})
+    e2 = estado.nova_sprint(config.RELATORIOS)
+    bk2 = _pendencia(e2, "<sujo/>")
+    fases._restaurar_pendentes()
+    assert _appdata() == "<sujo/>" and bk2.exists() and (e2.pasta / "appdata-sujo.json").exists()
+
+
+def test_suite_recusa_com_pendencia_em_qualquer_sprint(sprint):
+    e1 = sprint["estado"]
+    sprint["compilado"]("Debug")
+    e2 = estado.nova_sprint(config.RELATORIOS)  # outra sprint, com pendência que não restaura
+    sandbox.escrever_json(e2.pasta / "appdata-sujo.json", {"backup": str(config.BACKUPS / "sumiu"), "desde": "x"})
+    assert fases._suite(Args()) == 1
+    assert sprint["chamadas"] == []
+    assert "pendente" in _resultados(e1)[("saude/suite-existente", "main")]["motivo"]
+
+
+def test_registrar_recusa_fonte_mecanica(sprint, tmp_path, capsys):
+    for fonte in ("build", "suite"):
+        arq = tmp_path / f"falso-{fonte}.json"
+        arq.write_text(json.dumps(dict(_achado_valido(), fonte=fonte)), encoding="utf-8")
+        assert main(["achado", "registrar", str(arq)]) == 1
+        assert "reservada" in capsys.readouterr().out
+        assert not (sprint["estado"].pasta / "achados-brutos" / arq.name).exists()
+
+
+def test_restauracao_pendente_da_propria_sprint_nao_se_perde_quando_a_suite_salva_o_estado(sprint):
+    e = sprint["estado"]
+    sprint["compilado"]("Debug")
+    _pendencia(e, "<sujo por uma suíte que caiu/>")
+    assert fases._suite(Args()) == 0
+    quem = [r["quem"] for r in estado.carregar(e.pasta).restauracoes]
+    assert quem == ["retomada", "suite"]

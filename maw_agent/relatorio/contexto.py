@@ -67,7 +67,8 @@ def _limitacoes_dos_agentes(pasta: Path, erros_agente: list[str]) -> list[str]:
         except (OSError, ValueError) as ex:
             erros_agente.append(f"limitações ilegíveis em {arq.name}: {ex}")
             continue
-        out += [str(l) if agente == "suite" else f"{agente}: {l}" for l in lista]
+        # as da própria CLI (suíte, ambiente) já dizem de onde vêm; as dos subagentes levam o nome
+        out += [str(l) if agente in ("suite", "ambiente") else f"{agente}: {l}" for l in lista]
     return out
 
 
@@ -98,7 +99,13 @@ def _metodo(estado: dict) -> list[str]:
         falhas = sum(1 for x in regs[:-1] if not x.get("verificado"))
         antes = f", depois de {falhas} tentativa(s) de restauração com falha" if falhas else ""
         quando = r.get("quando", "?")
-        if r.get("backup_apagado"):
+        if r.get("descartado"):
+            out.append(f"Um backup temporário das configurações da MAW ({backup}) foi apagado sem ser restaurado "
+                       f"({quando}): {r['descartado']}.")
+        elif r.get("adiada"):
+            out.append(f"O backup temporário das configurações da MAW foi mantido em {backup}: a restauração foi "
+                       f"adiada porque a MAW estava aberta ({quando}); feche a MAW e rode `sprint iniciar` de novo.")
+        elif r.get("backup_apagado"):
             out.append(f"Um backup temporário das configurações da MAW (%APPDATA%\\MAW) existiu durante a execução "
                        f"({r.get('quem', '?')}) e foi apagado depois da restauração verificada ({quando}{antes}).")
         else:
