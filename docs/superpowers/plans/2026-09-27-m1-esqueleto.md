@@ -492,7 +492,7 @@ git commit -m "feat(sandbox): escrita protegida e backup/restauracao de pasta"
 
 **Files:**
 - Create: `maw_agent/redacao.py`, `maw_agent/hook.py`, `ferramentas/hooks/pre-commit`, `tests/test_redacao.py`, `tests/test_hook.py`
-- Create (privado): `privado/ferramentas/hooks/pre-commit`
+- Create (privado): `privado/ferramentas/hooks/pre-commit`, `privado/catalogo/termos-proibidos.txt` (lista inicial; a Task 15 completa)
 
 **Interfaces:**
 - Consumes: `config.TERMOS_PROIBIDOS`, `sandbox`
@@ -720,6 +720,8 @@ cd "$raiz" && exec "$raiz/.venv/Scripts/python.exe" -m maw_agent hook-precommit 
 Run: `.venv/Scripts/python -m pytest tests/test_redacao.py tests/test_hook.py -v`
 Expected: todos passam
 
+- [ ] **Step 4b: Lista inicial de termos proibidos** — criar `privado/catalogo/termos-proibidos.txt` (o hook público recusa qualquer commit sem ela). Conteúdo: um comentário de cabeçalho, uma linha `re:Maw[A-Z][A-Za-z]+` (prefixo das classes da MAW) e, tirados das seções 2 e 5 do apêndice privado (`privado/docs/2026-09-27-apendice-maw.md`), os nomes de classes/arquivos-fonte internos que não começam com esse prefixo e os caminhos fixos da máquina de desenvolvimento. **Não** incluir: o nome do executável, do projeto de build, da pasta de builds nem do arquivo do serviço Python — o agente público precisa deles. Conferir que `git add -A` no público + `python -m maw_agent hook-precommit --repo publico` passa.
+
 - [ ] **Step 5: Instalar e conferir o hook de verdade**
 
 Run: `.venv/Scripts/python -m maw_agent instalar-hooks` e, no público, `echo "AIza$(printf 'D%.0s' $(seq 35))" > t.txt && git add t.txt && git commit -m t` 
@@ -730,7 +732,7 @@ Expected: commit recusado com `contém segredo`; depois `git reset t.txt && rm t
 ```bash
 git add maw_agent/redacao.py maw_agent/hook.py ferramentas tests/test_redacao.py tests/test_hook.py
 git commit -m "feat(seguranca): depurador de segredos e hook de pre-commit"
-git -C privado add ferramentas && git -C privado commit -m "feat(seguranca): hook de pre-commit do privado"
+git -C privado add ferramentas catalogo/termos-proibidos.txt && git -C privado commit -m "feat(seguranca): hook de pre-commit e termos proibidos"
 ```
 
 ---
@@ -2680,6 +2682,7 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
 # maw_agent/relatorio/pdf.py
 """HTML (Jinja2) → PDF pelo Edge do Windows (Playwright, canal msedge) + anexo JSON (pypdf)."""
 from __future__ import annotations
+import io
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -2721,7 +2724,8 @@ def renderizar(ctx: dict, destino: Path) -> Path:
 
 
 def anexar(pdf: Path, arquivo: Path, nome: str) -> None:
-    escritor = PdfWriter(clone_from=PdfReader(pdf))
+    # lido para a memória: no Windows um PdfReader sobre o caminho segura o arquivo aberto
+    escritor = PdfWriter(clone_from=PdfReader(io.BytesIO(Path(pdf).read_bytes())))
     escritor.add_attachment(nome, Path(arquivo).read_bytes())
     tmp = Path(pdf).with_suffix(".tmp.pdf")
     sandbox.garantir_escrita(tmp)
@@ -2732,7 +2736,7 @@ def anexar(pdf: Path, arquivo: Path, nome: str) -> None:
 
 
 def ler_anexo(pdf: Path, nome: str) -> bytes:
-    anexos = PdfReader(pdf).attachments
+    anexos = PdfReader(io.BytesIO(Path(pdf).read_bytes())).attachments
     if nome not in anexos:
         raise KeyError(f"{nome} não está anexado a {pdf}")
     return anexos[nome][0]
@@ -3621,7 +3625,7 @@ def test_catalogo_validar_exige_itens_de_saude(tmp_path, monkeypatch, capsys):
 
 - [ ] **Step 2: `principios.yaml`** — os 14 princípios do apêndice privado (seção 3), cada um `{id: P1, titulo, descricao, fontes: [...], como_verificar: [...], area, verificacao: [revisao, ...], marco}`.
 
-- [ ] **Step 3: `funcionalidades.yaml`** — despachar o subagente `catalogador` sobre `work/alvos/main` com a instrução de gerar o catálogo inteiro a partir do zero (seção 2 do apêndice + READMEs), incluindo os itens `principio/P*` e `saude/*`, e mapear os blocos da suíte existente em `cenarios: [suite:...]`. Rodar `MA catalogo validar` até `erros: []`.
+- [ ] **Step 3: `funcionalidades.yaml`** — o implementador faz o papel do `catalogador` (seguindo `.claude/agents/catalogador.md`; não despacha subagentes) sobre `work/alvos/main`, gerando o catálogo inteiro a partir do zero (seção 2 do apêndice + READMEs), incluindo os itens `principio/P*` e `saude/*`, e mapear os blocos da suíte existente em `cenarios: [suite:...]`. Rodar `MA catalogo validar` até `erros: []`.
 
 - [ ] **Step 4: `termos-proibidos.txt`** — tirados das seções 2 e 5 do apêndice privado: nomes de classes, métodos e arquivos-fonte internos da MAW e os caminhos fixos da máquina de desenvolvimento, mais um regex para o prefixo das classes da MAW. **Não** entram nomes de que o agente público precisa para funcionar: o executável, o projeto de build, a pasta de builds e o nome do arquivo do serviço Python (os caminhos fixos que o agente precisar no M4 vêm de `privado/config.yaml`). Conferir: `git add -A && MA hook-precommit --repo publico` no público passa, e colocar de propósito um termo num arquivo temporário faz falhar.
 
@@ -3631,13 +3635,13 @@ def test_catalogo_validar_exige_itens_de_saude(tmp_path, monkeypatch, capsys):
 git -C privado add catalogo && git -C privado commit -m "feat(catalogo): catalogo inicial, principios e termos proibidos"
 ```
 
-- [ ] **Step 6: Rodar a primeira sprint (M1)** — executar `/sprint` inteiro (seguindo `.claude/commands/sprint.md`). Conferir:
+- [ ] **Step 6 (controlador, depois da revisão final): Rodar a primeira sprint (M1)** — executar `/sprint` inteiro (seguindo `.claude/commands/sprint.md`). Conferir:
   - `privado/relatorios/sprint-01/MAW-Sprint-01.pdf` existe, abre, tem capa, resumo, fichas, matriz e limitações;
   - o anexo `achados.json` sai com `MA`/pypdf;
   - `intocada.json` diz `verificado: true` e `ambiente_restaurado: true`;
   - a matriz não tem célula vazia; itens de GUI aparecem como `nao_testavel` com o marco previsto.
 
-- [ ] **Step 7: Commit dos resultados no privado** (o público não recebe nada da sprint)
+- [ ] **Step 7 (controlador): Commit dos resultados no privado** (o público não recebe nada da sprint)
 
 ```bash
 git -C privado add relatorios historico && git -C privado commit -m "sprint 01: relatorio M1"
