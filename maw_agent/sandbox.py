@@ -22,6 +22,20 @@ class RestauracaoFalhou(Exception):
     """A pasta restaurada não ficou idêntica ao backup."""
 
 
+# Esperas entre as 5 tentativas de uma operação que o Windows recusa com PermissionError
+# (antivírus, indexador ou a própria MAW segurando o arquivo por um instante).
+ESPERAS = (0.2, 0.5, 1.0, 2.0)
+
+
+def _com_tentativas(operacao):
+    for espera in ESPERAS:
+        try:
+            return operacao()
+        except PermissionError:
+            time.sleep(espera)
+    return operacao()
+
+
 def _real(p: Path) -> Path:
     # os.path.realpath segue symlinks/junctions das partes que existem
     return Path(os.path.realpath(Path(p).absolute()))
@@ -52,7 +66,11 @@ def escrever_bytes(p: Path, dados: bytes) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_bytes(dados)
-    os.replace(tmp, p)
+    try:
+        _com_tentativas(lambda: os.replace(tmp, p))
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
     return p
 
 
@@ -86,6 +104,10 @@ def remover(p: Path) -> None:
         p.unlink()
 
 
+def _hash(arq: Path) -> str:
+    return hashlib.sha256(Path(arq).read_bytes()).hexdigest()
+
+
 def manifesto(pasta: Path) -> dict[str, str]:
     pasta = Path(pasta)
     if not pasta.exists():
@@ -93,7 +115,7 @@ def manifesto(pasta: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for arq in sorted(pasta.rglob("*")):
         if arq.is_file():
-            out[arq.relative_to(pasta).as_posix()] = hashlib.sha256(arq.read_bytes()).hexdigest()
+            out[arq.relative_to(pasta).as_posix()] = _hash(arq)
     return out
 
 
@@ -113,18 +135,69 @@ def backup_pasta(origem: Path, destino_raiz: Path) -> Path:
     return destino
 
 
+def _restaurar_arquivo(de: Path, para: Path) -> None:
+    """Copia `de` sobre `para` por um temporário na mesma pasta e troca com os.replace."""
+    garantir_escrita(para)
+    para.parent.mkdir(parents=True, exist_ok=True)
+    tmp = para.with_name(para.name + ".restaurando.tmp")
+    shutil.copy2(de, tmp)
+    try:
+        _com_tentativas(lambda: os.replace(tmp, para))
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _apagar(p: Path) -> None:
+    garantir_escrita(p)
+    if p.is_dir() and not p.is_symlink() and not os.path.isjunction(p):
+        _com_tentativas(lambda: os.rmdir(p))
+    else:
+        _com_tentativas(lambda: p.unlink())
+
+
 def restaurar_pasta(backup: Path) -> None:
+    """Devolve a pasta de origem ao estado do backup sem nunca apagá-la inteira antes:
+    regrava por cima só os arquivos que mudaram, depois apaga o que sobrou. Cada operação tem
+    até 5 tentativas contra PermissionError; qualquer falha final vira RestauracaoFalhou, e o
+    resultado é conferido contra o manifesto do backup."""
     info = json.loads((Path(backup) / "manifesto.json").read_text(encoding="utf-8"))
     origem = Path(info["origem"])
+    esperado: dict[str, str] = info["arquivos"] if info["existia"] else {}
+    dados = Path(backup) / "dados"
     try:
-        if origem.exists():
-            remover(origem)
+        garantir_escrita(origem)
         if info["existia"]:
-            copiar(Path(backup) / "dados", origem)
+            origem.mkdir(parents=True, exist_ok=True)
+            for rel, h in esperado.items():
+                destino = origem / rel
+                if destino.is_file() and _hash(destino) == h:
+                    continue
+                if destino.is_dir():
+                    remover(destino)
+                _restaurar_arquivo(dados / rel, destino)
+        if origem.exists():
+            # o que sobrou: arquivos fora do manifesto, depois pastas vazias (as mais fundas primeiro)
+            for arq in sorted(origem.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+                rel = arq.relative_to(origem).as_posix()
+                if arq.is_file() or arq.is_symlink():
+                    if rel not in esperado:
+                        _apagar(arq)
+                elif arq.is_dir() and not any(arq.iterdir()) and not (dados / rel).is_dir() and not any(
+                        k.startswith(rel + "/") for k in esperado):
+                    _apagar(arq)
+            if not info["existia"]:
+                _apagar(origem)
     except EscritaProibida:
         raise
     except OSError as e:
         raise RestauracaoFalhou(f"erro ao restaurar {origem}: {e}") from e
     obtido = manifesto(origem)
-    if obtido != info["arquivos"]:
+    if obtido != esperado:
         raise RestauracaoFalhou(f"{origem} não ficou idêntica ao backup {backup}")
+
+
+def restaurar_e_descartar(backup: Path) -> None:
+    """Restaura, confere o manifesto e só então apaga o backup (que pode conter segredos)."""
+    restaurar_pasta(backup)
+    _com_tentativas(lambda: remover(backup))

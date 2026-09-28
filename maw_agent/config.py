@@ -8,13 +8,16 @@ WORK = RAIZ / "work"
 PRIVADO = RAIZ / "privado"
 ESPELHO = WORK / "espelho"
 ALVOS_DIR = WORK / "alvos"
-BACKUPS = WORK / "appdata-backup"
 FERRAMENTAS = WORK / "ferramentas"
 RELATORIOS = PRIVADO / "relatorios"
 HISTORICO = PRIVADO / "historico" / "achados.json"
 CATALOGO = PRIVADO / "catalogo" / "funcionalidades.yaml"
 PRINCIPIOS = PRIVADO / "catalogo" / "principios.yaml"
 TERMOS_PROIBIDOS = PRIVADO / "catalogo" / "termos-proibidos.txt"
+# Backups do %APPDATA%\MAW ficam fora da árvore do repositório (contêm a chave do Gemini)
+# e são apagados logo depois da restauração verificada.
+LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+BACKUPS = LOCALAPPDATA / "AgenteMAW" / "backups"
 APPDATA_MAW = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "MAW"
 URL_MAW = "https://github.com/WaynerMoraes12/MAW.git"
 USUARIO = Path(os.environ.get("USERPROFILE", str(Path.home())))
