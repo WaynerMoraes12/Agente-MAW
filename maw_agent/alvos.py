@@ -139,6 +139,7 @@ def criar_worktree(espelho: Path, alvo: Alvo, raiz: Path = config.ALVOS_DIR) -> 
         if git(["rev-parse", "HEAD"], destino) == alvo.commit:
             return destino
         git(["checkout", "-q", "--detach", "--force", alvo.commit], destino)
+        git(["clean", "-fdq"], destino)  # sem -x: mantém o que o .gitignore ignora (ex.: build/)
         return destino
     sandbox.criar_pasta(Path(raiz))
     git(["worktree", "prune"], espelho)

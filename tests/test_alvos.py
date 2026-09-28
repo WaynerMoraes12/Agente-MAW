@@ -113,3 +113,36 @@ def test_worktree_no_commit_do_alvo(mundo, tmp_path):
     wt = alvos.criar_worktree(esp, x, tmp_path / "alvos")
     assert (wt / "Source" / "a.cpp").read_text() == "2"
     assert alvos.criar_worktree(esp, x, tmp_path / "alvos") == wt  # reaproveita
+
+def test_worktree_reaproveitada_troca_de_commit_limpa_sobras(mundo, tmp_path):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    lista, _ = alvos.descobrir_alvos(esp, [])
+    x = next(a for a in lista if a.nome == "feature-x")
+    raiz = tmp_path / "alvos"
+    wt = alvos.criar_worktree(esp, x, raiz)
+
+    # feature/x anda no "GitHub": novo commit acrescenta .gitignore com build/
+    sh("checkout", "-q", "feature/x", cwd=mundo["origem"])
+    (mundo["origem"] / ".gitignore").write_text("build/\n")
+    sh("add", "-A", cwd=mundo["origem"]); sh("commit", "-qm", "gitignore", cwd=mundo["origem"])
+    novo_commit = sh("rev-parse", "HEAD", cwd=mundo["origem"])
+    sh("push", "-q", str(mundo["bare"]), "feature/x", cwd=mundo["origem"])
+    alvos.garantir_espelho(esp, str(mundo["bare"]))
+
+    lista2, _ = alvos.descobrir_alvos(esp, [])
+    x2 = next(a for a in lista2 if a.nome == "feature-x")
+    assert x2.commit == novo_commit
+
+    # sobras no worktree existente: um arquivo não rastreado e um "build" ignorado
+    (wt / "lixo.txt").write_text("lixo")
+    (wt / "build").mkdir(exist_ok=True)
+    (wt / "build" / "obj.o").write_text("obj")
+
+    wt2 = alvos.criar_worktree(esp, x2, raiz)
+
+    assert wt2 == wt
+    assert sh("rev-parse", "HEAD", cwd=wt2) == novo_commit
+    assert (wt2 / "Source" / "a.cpp").read_text() == "2"
+    assert (wt2 / ".gitignore").exists()
+    assert not (wt2 / "lixo.txt").exists()
+    assert (wt2 / "build" / "obj.o").exists()
