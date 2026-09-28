@@ -13,12 +13,15 @@ FINAL = "relatorio"  # a sprint só está concluída quando o PDF existe
 
 
 class Estado:
-    def __init__(self, pasta: Path, numero: int, passos: dict | None = None, criado: str | None = None):
+    def __init__(self, pasta: Path, numero: int, passos: dict | None = None, criado: str | None = None,
+                 restauracoes: list[dict] | None = None):
         self.pasta = Path(pasta)
         self.numero = numero
         self.nome = f"sprint-{numero:02d}"
         self.passos: dict[str, dict] = passos or {}
         self.criado = criado or time.strftime("%Y-%m-%dT%H:%M:%S")
+        # cada restauração do %APPDATA%\MAW feita nesta sprint, com o resultado da conferência
+        self.restauracoes: list[dict] = restauracoes or []
 
     @staticmethod
     def _agora() -> str:
@@ -44,14 +47,19 @@ class Estado:
         p.update({"status": "falhou", "fim": self._agora(), "erro": erro})
         self.salvar()
 
+    def registrar_restauracao(self, registro: dict) -> None:
+        self.restauracoes.append({"quando": self._agora(), **registro})
+        self.salvar()
+
     def salvar(self) -> None:
         sandbox.escrever_json(self.pasta / "estado.json",
-                              {"numero": self.numero, "criado": self.criado, "passos": self.passos})
+                              {"numero": self.numero, "criado": self.criado, "passos": self.passos,
+                               "restauracoes": self.restauracoes})
 
 
 def carregar(pasta: Path) -> Estado:
     d = json.loads((Path(pasta) / "estado.json").read_text(encoding="utf-8"))
-    return Estado(pasta, d["numero"], d["passos"], d.get("criado"))
+    return Estado(pasta, d["numero"], d["passos"], d.get("criado"), d.get("restauracoes"))
 
 
 def _existentes(raiz: Path) -> list[Path]:
@@ -69,12 +77,13 @@ def nova_sprint(raiz: Path = config.RELATORIOS) -> Estado:
 
 
 def em_andamento(raiz: Path = config.RELATORIOS) -> Estado | None:
-    for p in reversed(_existentes(raiz)):
-        if (p / "estado.json").exists():
-            e = carregar(p)
-            if not e.feito(FINAL):
-                return e
-    return None
+    """Só a sprint mais nova pode estar em andamento: se ela está concluída, nenhuma está.
+    Uma sprint antiga abandonada nunca é retomada."""
+    existentes = [p for p in _existentes(raiz) if (p / "estado.json").exists()]
+    if not existentes:
+        return None
+    e = carregar(existentes[-1])
+    return None if e.feito(FINAL) else e
 
 
 def anterior(e: Estado) -> Path | None:
