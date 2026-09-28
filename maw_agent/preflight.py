@@ -80,7 +80,8 @@ def _msbuild() -> tuple[str | None, str]:
     """
     try:
         from .build import localizar_msbuild
-        return str(localizar_msbuild()), str(localizar_msbuild())
+        caminho = str(localizar_msbuild())
+        return caminho, caminho
     except FileNotFoundError as e:
         return None, str(e)
     except subprocess.TimeoutExpired:
