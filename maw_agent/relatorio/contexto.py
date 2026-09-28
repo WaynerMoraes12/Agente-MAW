@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from .. import catalogo
+from ..estado import FASES, FINAL
 
 ABERTOS = ("novo", "aberto", "regressao", "nao_verificavel")
 _ROTULO_SEMAFORO = {"pronto": "Pronto para merge", "com_ressalvas": "Com ressalvas", "bloqueado": "Bloqueado"}
@@ -41,10 +42,70 @@ def _duracao(estado: dict) -> str:
     return f"{h} h {r // 60:02d} min"
 
 
+def _concluido(passos: dict, nome: str) -> bool:
+    return passos.get(nome, {}).get("status") == "concluido"
+
+
+def _limitacoes_das_fases(passos: dict) -> list[str]:
+    """Fases do fluxo nunca concluídas e passos que ficaram em andamento (interrompidos). O passo
+    final (o relatório) está em andamento por definição enquanto o PDF é gerado."""
+    out = [f"fase {f} não concluída" for f in FASES if f != FINAL and not _concluido(passos, f)]
+    out += [f"passo {p} não concluído (interrompido)" for p, info in passos.items()
+            if p != FINAL and info.get("status") == "em_andamento"]
+    return out
+
+
+def _limitacoes_dos_agentes(pasta: Path, erros_agente: list[str]) -> list[str]:
+    """Cada `limitacoes-<agente>.json` é uma lista de strings: o que o agente não conseguiu verificar."""
+    out = []
+    for arq in sorted(pasta.glob("limitacoes-*.json")):
+        agente = arq.stem[len("limitacoes-"):]
+        try:
+            lista = json.loads(arq.read_text(encoding="utf-8"))
+            if not isinstance(lista, list):
+                raise ValueError("não é uma lista de textos")
+        except (OSError, ValueError) as ex:
+            erros_agente.append(f"limitações ilegíveis em {arq.name}: {ex}")
+            continue
+        out += [str(l) if agente == "suite" else f"{agente}: {l}" for l in lista]
+    return out
+
+
+def _prova(pasta: Path) -> list[dict]:
+    """Tabela da prova de intocada: pasta, HEAD antes/depois (ou a contagem de arquivos) e se ficou igual."""
+    antes = _ler(pasta / "prova-antes.json", {})
+    depois = _ler(pasta / "prova-depois.json", {})
+
+    def resumo(p: dict | None) -> str:
+        if p is None:
+            return "ausente"
+        if p.get("tipo") == "arquivos":
+            return f"sem git: {len(p.get('arquivos', []))} arquivo(s)"
+        return (p.get("head") or "?")[:10]
+
+    return [{"pasta": nome, "antes": resumo(antes.get(nome)), "depois": resumo(depois.get(nome)),
+             "igual": antes.get(nome) == depois.get(nome)} for nome in sorted(set(antes) | set(depois))]
+
+
+def _metodo(estado: dict) -> list[str]:
+    out = []
+    for r in estado.get("restauracoes", []):
+        quando = r.get("quando", "?")
+        if r.get("backup_apagado"):
+            out.append(f"Um backup temporário das configurações da MAW (%APPDATA%\\MAW) existiu durante a execução "
+                       f"({r.get('quem', '?')}) e foi apagado depois da restauração verificada ({quando}).")
+        else:
+            motivo = r.get("erro") or r.get("erro_ao_apagar") or "motivo não informado"
+            out.append(f"O backup temporário das configurações da MAW foi mantido em {r.get('backup')} "
+                       f"porque a restauração ou a remoção falhou ({quando}): {motivo}.")
+    return out
+
+
 def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Path | None,
            logo: Path | None) -> dict:
     pasta = Path(pasta)
     estado = _ler(pasta / "estado.json", {"numero": 0, "passos": {}})
+    passos = estado.get("passos", {})
     alvos_info = _ler(pasta / "alvos.json", {"alvos": [], "avisos": []})
     achados_lista = _ler(pasta / "achados.json", [])
     for a in achados_lista:
@@ -57,13 +118,23 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
                                               "ambiente_restaurado": False})
     textos = _ler(pasta / "textos.json", {})
     resumo = textos.get("resumo")
+    erros_agente = _ler(pasta / "erros_agente.json", [])
     limitacoes: list[str] = list(alvos_info.get("avisos", []))
+    limitacoes += _limitacoes_das_fases(passos)
+    achados_anexados = _concluido(passos, "consolidar") and (pasta / "achados.json").exists()
+    if not _concluido(passos, "consolidar"):
+        limitacoes.append("achados não consolidados nesta execução")
+    sem_verificacao = (passos.get("consolidar", {}).get("detalhe") or {}).get("sem_verificacao_adversarial", 0)
+    if sem_verificacao:
+        limitacoes.append(f"{sem_verificacao} achado(s) sem verificação adversarial (veredito ausente ou "
+                          "ilegível): entraram como prováveis")
     if not resumo:
         limitacoes.append("resumo executivo não redigido nesta execução")
         resumo = ""
     for v in _ler(pasta / "preflight.json", []):
         if not v["ok"]:
             limitacoes.append(f"Pré-voo: {v['detalhe']}")
+    limitacoes += _limitacoes_dos_agentes(pasta, erros_agente)
     nomes = [a["nome"] for a in alvos_info["alvos"]]
     alvos = []
     for a in alvos_info["alvos"]:
@@ -74,7 +145,19 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         if b_rel is None:
             limitacoes.append(f"{a['nome']}: build Release não registrado")
         doalvo = [x for x in achados_lista if a["nome"] in {y["alvo"] for y in x["alvos"]}]
-        sem = semaforo(doalvo, build_ok)
+        herdados = []
+        if a.get("compartilha_com"):
+            # mesma árvore de código: os achados de código da origem valem aqui também; os de
+            # documentação não, porque a documentação é revisada por alvo
+            herdados = [x for x in achados_lista if x not in doalvo
+                        and origem in {y["alvo"] for y in x["alvos"]}
+                        and not x.get("item_catalogo", "").startswith("documentacao/")]
+        sem = semaforo(doalvo + herdados, build_ok)
+        suite_alvo = _ler(pasta / "suites" / f"{origem}.json")
+        if suite_alvo and not a.get("compartilha_com"):
+            if suite_alvo.get("captura_erro"):
+                limitacoes.append(f"jassert não capturado no alvo {a['nome']}: {suite_alvo['captura_erro']}")
+            limitacoes += [f"{a['nome']}: aviso antes da suíte: {l}" for l in suite_alvo.get("preambulo", [])]
         texto_alvo = textos.get("por_alvo", {}).get(a["nome"])
         if not texto_alvo:
             limitacoes.append(f"texto do alvo {a['nome']} não redigido nesta execução")
@@ -82,9 +165,10 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         alvos.append({**a, "semaforo": sem,
                       "semaforo_rotulo": _ROTULO_SEMAFORO[sem],
                       "build": b_rel, "build_debug": b_dbg,
-                      "suite": _ler(pasta / "suites" / f"{origem}.json"),
+                      "suite": suite_alvo,
                       "benchmark": _ler(pasta / "benchmarks" / f"{origem}.json"),
-                      "achados_ids": [x["id"] for x in doalvo],
+                      "achados_ids": [x["id"] for x in doalvo + herdados],
+                      "herdados": [x["id"] for x in herdados],
                       "introduzidos": [x["id"] for x in doalvo if x.get("introduzido_por") == a["nome"]],
                       "texto": texto_alvo})
     resultados = catalogo.carregar_resultados(pasta)
@@ -95,14 +179,14 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
     motivos = Counter(c["motivo"] for l in m.values() for c in l.values() if c["resultado"] == "nao_testavel")
     for motivo, n in motivos.most_common():
         limitacoes.append(f"{n} célula(s) não testável(is): {motivo or 'motivo não informado'}")
-    problemas = [a for a in achados_lista if a["tipo"] != "melhoria"]
-    melhorias = [a for a in achados_lista if a["tipo"] == "melhoria"]
+    # fichas para o agente de correção: só o que está aberto; corrigidos ficam só na lista de corrigidos
+    problemas = [a for a in achados_lista if a["tipo"] != "melhoria" and a["estado"] != "corrigido"]
+    melhorias = [a for a in achados_lista if a["tipo"] == "melhoria" and a["estado"] != "corrigido"]
     provaveis = [a for a in achados_lista if a.get("confianca") == "provavel"]
     if provaveis:
         limitacoes.append(f"{len(provaveis)} achado(s) marcado(s) como provável(is): evidentes no código, não reproduzidos dinamicamente")
     derrubados = _ler(pasta / "derrubados.json", [])
-    erros_agente = _ler(pasta / "erros_agente.json", [])
-    for passo, info in estado.get("passos", {}).items():
+    for passo, info in passos.items():
         if info.get("status") == "falhou":
             erros_agente.append(f"passo {passo} falhou: {info.get('erro') or 'sem mensagem de erro'}")
     abertos = [a for a in problemas if a["estado"] in ABERTOS]
@@ -140,6 +224,9 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         "derrubados": derrubados,
         "erros_agente": erros_agente,
         "intocada": intocada,
+        "prova": _prova(pasta),
+        "metodo": _metodo(estado),
+        "achados_anexados": achados_anexados,
         "ambiente": _ler(pasta / "ambiente.json", {}),
         "preflight": _ler(pasta / "preflight.json", []),
         "anterior": anterior.name if anterior else None,

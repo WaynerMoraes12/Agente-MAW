@@ -55,7 +55,7 @@
     <h3>{{ a.nome }} <span class="sem {{ a.semaforo }}">{{ a.semaforo_rotulo }}</span></h3>
     <p class="mono">{{ a.branch }} @ {{ a.commit[:10] }} ({{ a.origem }}){% if a.compartilha_com %} — mesma árvore de código de {{ a.compartilha_com }}: execução compartilhada{% endif %}</p>
     {% if a.texto %}<p>{{ a.texto }}</p>{% endif %}
-    <p>Achados neste alvo: {{ a.achados_ids | join(', ') or 'nenhum' }}{% if a.introduzidos %} · introduzidos por esta branch: {{ a.introduzidos | join(', ') }}{% endif %}</p>
+    <p>Achados neste alvo: {{ a.achados_ids | join(', ') or 'nenhum' }}{% if a.introduzidos %} · introduzidos por esta branch: {{ a.introduzidos | join(', ') }}{% endif %}{% if a.herdados %} · herdados de {{ a.compartilha_com }} (mesma árvore de código): {{ a.herdados | join(', ') }}{% endif %}</p>
   </div>
   {% endfor %}
 </section>
@@ -68,7 +68,8 @@
     <li>Nunca altere um teste para que ele passe.</li>
     <li>Um achado por commit, citando o ID (ex.: <span class="mono">fix: … (MAW-0001)</span>).</li>
     <li>O achado só está corrigido quando o critério de aceite passa.</li>
-    <li>Os dados exatos de todos os achados estão no arquivo <span class="mono">achados.json</span> anexado a este PDF.</li>
+    {% if achados_anexados %}<li>Os dados exatos de todos os achados estão no arquivo <span class="mono">achados.json</span> anexado a este PDF.</li>
+    {% else %}<li>Nenhum <span class="mono">achados.json</span> acompanha este PDF: os achados não foram consolidados nesta execução (ver limitações).</li>{% endif %}
   </ol>
 </section>
 
@@ -139,5 +140,11 @@
   <table class="grade">{% for k, v in ambiente.items() %}<tr><td>{{ k }}</td><td>{{ v if v is string else (v | join(', ') if v is iterable else v) }}</td></tr>{% endfor %}</table>
   <h3>Pré-voo</h3>
   <ul>{% for v in preflight %}<li>{{ '✓' if v.ok else '✗' }} {{ v.nome }} — {{ v.detalhe }}</li>{% endfor %}</ul>
+  <h3>Prova de MAW intocada</h3>
+  {% if prova %}<table class="grade"><tr><th>Pasta</th><th>HEAD antes</th><th>HEAD depois</th><th>Status igual?</th></tr>
+  {% for l in prova %}<tr><td>{{ l.pasta }}</td><td class="mono">{{ l.antes }}</td><td class="mono">{{ l.depois }}</td><td>{{ 'sim' if l.igual else 'NÃO' }}</td></tr>{% endfor %}
+  </table>{% else %}<p>Nenhuma pasta da MAW registrada na prova.</p>{% endif %}
+  <h3>Método</h3>
+  <ul>{% for m in metodo %}<li>{{ m }}</li>{% else %}<li>Nenhum backup das configurações da MAW foi necessário nesta execução.</li>{% endfor %}</ul>
 </section>
 </body></html>
