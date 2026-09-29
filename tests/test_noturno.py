@@ -101,6 +101,8 @@ def test_xml_da_tarefa_chama_o_script_pelo_powershell():
     args = exe.find("t:Arguments", NS).text
     assert '-File "C:\\Agente X\\ferramentas\\noturno.ps1"' in args
     assert "-NoProfile" in args and "-ExecutionPolicy Bypass" in args
+    # janela oculta: uma janela minimizada fechada por engano matou a noite de 28/09
+    assert "-WindowStyle Hidden" in args and "Minimized" not in args
     assert exe.find("t:WorkingDirectory", NS).text == r"C:\Agente X"
 
 

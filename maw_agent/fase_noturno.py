@@ -175,7 +175,8 @@ def usuario_atual() -> str:
 
 
 def argumentos_powershell(script: Path) -> str:
-    return f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File "{script}"'
+    # janela oculta, não minimizada: fechar por engano a janela minimizada matava a noite inteira
+    return f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script}"'
 
 
 def xml_tarefa(hora: str, script: Path, raiz: Path, usuario: str, dia: date) -> str:
