@@ -20,6 +20,13 @@ TERCA = date(2026, 9, 29)
 TODOS = {"sprint", "achado", "catalogo", "e2e", "servico", "calibrar", "sondas", "noturno"}
 
 
+@pytest.fixture(autouse=True)
+def _bancada_sem_config_do_privado(tmp_path, monkeypatch):
+    """Nenhum teste lê `privado/bancada/config.yaml` de verdade (ele pode desativar a bancada); quem
+    precisa de uma configuração põe a sua."""
+    monkeypatch.setattr(N, "CONFIG_BANCADA", tmp_path / "sem-config-da-bancada.yaml")
+
+
 # ---------- argumentos ----------
 
 @pytest.mark.parametrize("texto,esperado", [("22:00", "22:00"), ("7:05", "07:05"), (" 00:00 ", "00:00"),
