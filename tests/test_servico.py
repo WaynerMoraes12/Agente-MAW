@@ -204,6 +204,257 @@ def test_avaliar_porta_nao_bate():
     assert not ok and "5000" in problemas[0]
 
 
+# ---------- porta do serviço e porta documentada ----------
+
+def test_resolver_porta_literal_e_a_do_servico():
+    fixa = ChecagemPorta(id="p", itens_catalogo=["a/x"], porta=5000, aberta_esperada=True)
+    do_servico = ChecagemPorta(id="q", itens_catalogo=["a/x"], porta="servico", aberta_esperada=True)
+    assert servico.resolver_porta(fixa, 6001) == 5000
+    assert servico.resolver_porta(do_servico, 6001) == 6001
+    with pytest.raises(ValueError):
+        servico.resolver_porta(do_servico, None)
+
+
+def test_portas_documentadas_primeiro_arquivo_que_casa(tmp_path):
+    (tmp_path / "LEIAME.md").write_text("O serviço escuta na porta **6001** (não na 6000).", encoding="utf-8")
+    (tmp_path / "cliente.h").write_text("static constexpr int portaDoServico = 6001;", encoding="utf-8")
+    doc = ({"arquivos": ["LEIAME.md"], "padrao": r"na porta \**(\d+)"},
+           {"arquivos": ["nao-existe.h", "cliente.h"], "padrao": r"portaDoServico = (\d+)|localhost:(\d+)"},
+           {"arquivos": ["LEIAME.md"], "padrao": r"porta secreta (\d+)"})
+    achadas, sem = servico.portas_documentadas(tmp_path, doc)
+    assert achadas == [("LEIAME.md", 6001), ("cliente.h", 6001)]
+    assert len(sem) == 1 and "porta secreta" in sem[0]
+
+
+def test_avaliar_porta_documentada_diferente_da_aberta():
+    chk = ChecagemPorta(id="p", itens_catalogo=["a/x"], porta="servico", aberta_esperada=True)
+    ok, problemas = servico.avaliar_porta(chk, True, porta=6001, documentadas=[("LEIAME.md", 6001)])
+    assert ok and problemas == []
+    ok, problemas = servico.avaliar_porta(chk, True, porta=6001, documentadas=[("LEIAME.md", 6000)])
+    assert not ok and "LEIAME.md documenta a porta 6000" in problemas[0] and "6001" in problemas[0]
+
+
+# ---------- PATH do processo do serviço ----------
+
+def test_pasta_scripts_de_venv_e_de_python_instalado(tmp_path):
+    assert servico.pasta_scripts(tmp_path / "amb" / "Scripts" / "python.exe") == tmp_path / "amb" / "Scripts"
+    assert servico.pasta_scripts(tmp_path / "Python310" / "python.exe") == tmp_path / "Python310" / "Scripts"
+
+
+def test_caminho_do_processo_poe_scripts_do_python_e_ffmpeg_na_frente(tmp_path):
+    scripts = tmp_path / "amb" / "Scripts"
+    scripts.mkdir(parents=True)
+    ffmpeg = tmp_path / "ffmpeg" / "bin"
+    ffmpeg.mkdir(parents=True)
+    path = servico.caminho_do_processo(scripts / "python.exe", ffmpeg, "C:/original")
+    assert path.split(os.pathsep) == [str(scripts), str(ffmpeg), "C:/original"]
+    # pasta que não existe não entra
+    assert servico.caminho_do_processo(tmp_path / "x" / "python.exe", None, "C:/original") == "C:/original"
+
+
+# ---------- ambiente Python do serviço, por alvo ----------
+
+def _alvo_com_requisitos(raiz: Path, nome: str = "alvo-a", requisitos: dict[str, str] | None = None) -> Path:
+    pasta = raiz / "alvos" / nome
+    pasta.mkdir(parents=True)
+    for rel, texto in (requisitos if requisitos is not None else {"requirements.txt": "pacote-a==1.0\n"}).items():
+        (pasta / rel).parent.mkdir(parents=True, exist_ok=True)
+        (pasta / rel).write_text(texto, encoding="utf-8")
+    return pasta
+
+
+def _ambiente_montado(nome: str, pasta_alvo: Path, rel: str, **marca) -> Path:
+    amb = servico.pasta_ambiente(nome)
+    py = servico.python_do_ambiente(amb)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_bytes(b"")
+    dados = {"requisitos": rel, "sha256": servico._sha256(pasta_alvo / rel), "ok": True, "insatisfazivel": False}
+    dados.update(marca)
+    (amb / servico.MARCA_AMBIENTE).write_text(json.dumps(dados), encoding="utf-8")
+    return py
+
+
+@pytest.fixture
+def work_tmp(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WORK", tmp_path / "work")
+    padrao = tmp_path / "work" / "py310" / "Scripts" / "python.exe"
+    monkeypatch.setattr(servico, "PYTHON_SERVICO_PADRAO", padrao)
+    return tmp_path
+
+
+def test_arquivo_requisitos_segue_a_ordem_dos_candidatos(tmp_path):
+    pasta = _alvo_com_requisitos(tmp_path, requisitos={"requirements.txt": "a\n", "trava/lock.txt": "a==1\n"})
+    assert servico.arquivo_requisitos(pasta, ("trava/lock.txt", "requirements.txt")) == pasta / "trava" / "lock.txt"
+    assert servico.arquivo_requisitos(pasta) == pasta / "requirements.txt"
+    assert servico.arquivo_requisitos(pasta, ("nao-existe.txt",)) is None
+
+
+def test_escolher_ambiente_sem_arquivo_de_requisitos_usa_o_comum_com_limitacao(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp, requisitos={})
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert amb.python == servico.PYTHON_SERVICO_PADRAO and not amb.proprio and not amb.insatisfazivel
+    assert "não tem arquivo de requisitos" in amb.limitacao
+
+
+def test_escolher_ambiente_ainda_nao_montado_usa_o_comum_e_pede_para_montar(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert not amb.proprio and amb.python == servico.PYTHON_SERVICO_PADRAO
+    assert "ainda não foi montado" in amb.limitacao and "MA servico ambientes" in amb.limitacao
+
+
+def test_escolher_ambiente_montado_pelos_requisitos_atuais_e_o_proprio(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp, requisitos={"requirements.txt": "a\n", "trava/lock.txt": "a==1\n"})
+    py = _ambiente_montado("alvo-a", pasta, "trava/lock.txt")
+    amb = servico.escolher_ambiente("alvo-a", pasta, ("trava/lock.txt", "requirements.txt"))
+    assert amb.proprio and amb.python == py and amb.limitacao is None
+    assert amb.requisitos == pasta / "trava" / "lock.txt"
+
+
+def test_escolher_ambiente_requisitos_mudaram_depois_de_montar(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    _ambiente_montado("alvo-a", pasta, "requirements.txt")
+    (pasta / "requirements.txt").write_text("pacote-a==2.0\n", encoding="utf-8")
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert not amb.proprio and "outra versão" in amb.limitacao
+
+
+def test_escolher_ambiente_lock_novo_no_alvo_desatualiza_o_montado_pelo_requirements(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    _ambiente_montado("alvo-a", pasta, "requirements.txt")
+    (pasta / "trava").mkdir()
+    (pasta / "trava" / "lock.txt").write_text("a==1\n", encoding="utf-8")
+    amb = servico.escolher_ambiente("alvo-a", pasta, ("trava/lock.txt", "requirements.txt"))
+    assert not amb.proprio and "requirements.txt" in amb.limitacao
+
+
+def test_escolher_ambiente_requisitos_insatisfaziveis_usa_o_comum_e_diz_por_que(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    _ambiente_montado("alvo-a", pasta, "requirements.txt", ok=False, insatisfazivel=True,
+                      motivo="No solution found when resolving dependencies")
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert not amb.proprio and amb.insatisfazivel and amb.python == servico.PYTHON_SERVICO_PADRAO
+    assert "insatisfazíveis" in amb.limitacao and "No solution found" in amb.limitacao
+
+
+def test_escolher_ambiente_montagem_que_falhou_por_outro_motivo_nao_e_insatisfazivel(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    _ambiente_montado("alvo-a", pasta, "requirements.txt", ok=False, insatisfazivel=False, motivo="sem rede")
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert not amb.proprio and not amb.insatisfazivel and "não pôde ser montado" in amb.limitacao
+
+
+def test_escolher_ambiente_sem_interpretador_nao_e_o_proprio(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    py = _ambiente_montado("alvo-a", pasta, "requirements.txt")
+    py.unlink()
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert not amb.proprio and "sem o interpretador" in amb.limitacao
+
+
+def test_ler_config_ambiente_do_yaml(tmp_path):
+    p = tmp_path / "servico.yaml"
+    p.write_text("ambiente:\n  requisitos: [trava/lock.txt, requirements.txt]\n  python: '3.11'\n", encoding="utf-8")
+    cfg = servico.ler_config_ambiente(p)
+    assert cfg.requisitos == ("trava/lock.txt", "requirements.txt") and cfg.python == "3.11"
+    assert servico.ler_config_ambiente(tmp_path / "nao-existe.yaml") == servico.ConfigAmbiente()
+
+
+class RodarFalso:
+    """Faz o papel do uv: registra os comandos e 'cria' o interpretador no `uv venv`."""
+
+    def __init__(self, respostas: dict[str, tuple[int, str]] | None = None):
+        self.chamadas: list[list[str]] = []
+        self.respostas = respostas or {}
+
+    def __call__(self, cmd: list[str], timeout: float) -> tuple[int, str]:
+        self.chamadas.append(cmd)
+        acao = cmd[1] if cmd[1] != "pip" else "pip"
+        codigo, saida = self.respostas.get(acao, (0, f"{acao} ok"))
+        if acao == "venv" and codigo == 0:
+            pasta = Path(cmd[-1])
+            py = servico.python_do_ambiente(pasta)
+            py.parent.mkdir(parents=True, exist_ok=True)
+            py.write_bytes(b"")
+            (pasta / "pyvenv.cfg").write_text("version_info = 3.10\n", encoding="utf-8")
+        return codigo, saida
+
+
+def test_montar_ambiente_cria_instala_e_marca(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp, requisitos={"requirements.txt": "a\n", "trava/lock.txt": "a==1\n"})
+    rodar = RodarFalso()
+    r = servico.montar_ambiente("alvo-a", pasta, ("trava/lock.txt", "requirements.txt"), uv=Path("uv.exe"),
+                                rodar=rodar)
+    assert r["ok"] and r["feito"] and r["requisitos"] == "trava/lock.txt"
+    assert [c[1] for c in rodar.chamadas] == ["venv", "pip"]
+    assert rodar.chamadas[0][2:4] == ["--python", "3.10"]
+    assert rodar.chamadas[1][-2:] == ["-r", str(pasta / "trava" / "lock.txt")]
+    amb = servico.escolher_ambiente("alvo-a", pasta, ("trava/lock.txt", "requirements.txt"))
+    assert amb.proprio and amb.python == servico.python_do_ambiente(servico.pasta_ambiente("alvo-a"))
+    assert (config.WORK / "py310-alvo-a-install.log").exists()
+
+
+def test_montar_ambiente_ja_montado_nao_roda_nada(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    _ambiente_montado("alvo-a", pasta, "requirements.txt")
+    rodar = RodarFalso()
+    r = servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"), rodar=rodar)
+    assert r["ok"] and not r["feito"] and rodar.chamadas == []
+
+
+def test_montar_ambiente_existente_sem_marca_so_instala(work_tmp):
+    """Um ambiente montado à mão (sem a marca) é completado pelos requisitos, sem ser recriado."""
+    pasta = _alvo_com_requisitos(work_tmp)
+    py = servico.python_do_ambiente(servico.pasta_ambiente("alvo-a"))
+    py.parent.mkdir(parents=True)
+    py.write_bytes(b"")
+    rodar = RodarFalso()
+    r = servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"), rodar=rodar)
+    assert r["ok"] and [c[1] for c in rodar.chamadas] == ["pip"]
+    assert servico.escolher_ambiente("alvo-a", pasta).proprio
+
+
+def test_montar_ambiente_requisitos_sem_solucao_marca_insatisfazivel_e_nao_tenta_de_novo(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    rodar = RodarFalso({"pip": (1, "  × No solution found when resolving dependencies:\n  pacote-a conflita")})
+    r = servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"), rodar=rodar)
+    assert not r["ok"] and r["insatisfazivel"] and "No solution found" in r["motivo"]
+    amb = servico.escolher_ambiente("alvo-a", pasta)
+    assert amb.insatisfazivel and amb.python == servico.PYTHON_SERVICO_PADRAO
+    rodar2 = RodarFalso()
+    r2 = servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"), rodar=rodar2)
+    assert rodar2.chamadas == [] and r2["insatisfazivel"]
+    servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"), rodar=rodar2, forcar=True)
+    assert [c[1] for c in rodar2.chamadas] == ["pip"]
+
+
+def test_montar_ambiente_falha_de_rede_nao_e_insatisfazivel(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    r = servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"),
+                                rodar=RodarFalso({"pip": (2, "error: Failed to fetch: connection reset")}))
+    assert not r["ok"] and not r["insatisfazivel"]
+    assert not servico.escolher_ambiente("alvo-a", pasta).insatisfazivel
+
+
+def test_montar_ambiente_sem_uv_nao_marca_nada(work_tmp, monkeypatch):
+    pasta = _alvo_com_requisitos(work_tmp)
+    monkeypatch.setattr(servico, "uv_padrao", lambda: None)
+    r = servico.montar_ambiente("alvo-a", pasta, rodar=RodarFalso())
+    assert not r["ok"] and "uv não encontrado" in r["motivo"]
+    assert not servico.pasta_ambiente("alvo-a").exists()
+
+
+def test_montar_ambiente_nao_mexe_em_pasta_que_nao_e_ambiente(work_tmp):
+    pasta = _alvo_com_requisitos(work_tmp)
+    alheia = servico.pasta_ambiente("alvo-a")
+    alheia.mkdir(parents=True)
+    (alheia / "algo-do-usuario.txt").write_text("x", encoding="utf-8")
+    rodar = RodarFalso()
+    r = servico.montar_ambiente("alvo-a", pasta, uv=Path("uv.exe"), rodar=rodar)
+    assert not r["ok"] and "não é um ambiente virtual" in r["motivo"] and rodar.chamadas == []
+    assert (alheia / "algo-do-usuario.txt").exists()
+
+
 # ---------- resolver_corpo ----------
 
 def test_resolver_corpo_substitui_tokens():
@@ -453,6 +704,19 @@ def test_servico_app_filtra_variaveis_que_parecem_credencial(fake_alvo, monkeypa
     assert capturado.get("OUTRA_VARIAVEL_QUALQUER") == "essa-pode-passar"
 
 
+def test_servico_app_poe_os_executaveis_do_python_do_servico_no_path(fake_alvo, tmp_path):
+    """Um serviço pode chamar uma ferramenta dos pacotes pelo nome (pelo PATH): a pasta Scripts do
+    Python do serviço vai na frente, junto com o ffmpeg."""
+    pasta, _porta = fake_alvo
+    ffmpeg = tmp_path / "ffmpeg-bin"
+    ffmpeg.mkdir()
+    with ServicoApp(pasta, script=NOME_SCRIPT_FALSO, python=Path(sys.executable), ffmpeg=ffmpeg, timeout_saude=10):
+        pass
+    capturado = json.loads((pasta / "ambiente_capturado.json").read_text(encoding="utf-8"))
+    partes = capturado["PATH"].split(os.pathsep)
+    assert partes[:2] == [str(servico.pasta_scripts(Path(sys.executable))), str(ffmpeg)]
+
+
 # ---------- fase_servico: orquestração completa contra o servidor falso ----------
 
 class Args:
@@ -607,6 +871,162 @@ def test_fase_servico_porta_ocupada_vira_nao_testavel_nunca_achado(sprint_servic
     assert any("ocupada por outro processo" in l for l in limitacoes)
 
 
+def _reescrever_cenarios(dados: dict) -> None:
+    base = {"script": NOME_SCRIPT_FALSO, "checagens": [], "comandos": [], "portas": [], "nao_testavel": []}
+    base.update(dados)
+    sandbox.escrever_texto(fase_servico.CAMINHO_CENARIOS, yaml.safe_dump(base, allow_unicode=True))
+
+
+def _limitacoes(e) -> list[str]:
+    p = e.pasta / "limitacoes-servico.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+
+
+_ECO_QUEBRADO_DEPENDE = {"id": "eco-quebrado", "rota": "/rota-a", "metodo": "POST", "corpo": {"a": 1},
+                         "status_esperado": 200, "chaves_esperadas": ["ok", "chave-que-nao-existe"],
+                         "itens_catalogo": ["servico/eco"], "esperado": "deveria ter a chave pedida", "depende_do_ambiente": True,
+                         "bancada": "b-eco"}
+
+
+def test_fase_servico_sem_ambiente_proprio_usa_o_comum_e_registra_limitacao(sprint_servico):
+    e = sprint_servico["estado"]
+    fase_servico.cmd_servico(Args())
+    dados = estado.carregar(e.pasta).dados("servico:main")
+    assert dados["ambiente_proprio"] is False and dados["python"] == str(Path(sys.executable))
+    assert any("não tem arquivo de requisitos" in l for l in _limitacoes(e))
+
+
+def test_fase_servico_usa_o_python_do_ambiente_do_alvo(sprint_servico, monkeypatch):
+    e = sprint_servico["estado"]
+    escolhas = []
+
+    def escolher(nome, pasta_alvo, candidatos=servico.REQUISITOS_PADRAO, **kw):
+        escolhas.append((nome, tuple(candidatos)))
+        return servico.AmbienteServico(Path(sys.executable), True, pasta_alvo / "requirements.txt")
+
+    monkeypatch.setattr(servico, "escolher_ambiente", escolher)
+    monkeypatch.setattr(servico, "PYTHON_SERVICO_PADRAO", Path("C:/nao-existe/python.exe"))  # nunca é usado
+    fase_servico.cmd_servico(Args())
+    assert escolhas == [("main", servico.REQUISITOS_PADRAO)]
+    dados = estado.carregar(e.pasta).dados("servico:main")
+    assert dados["ambiente_proprio"] is True and dados["saude"]["ok"] is True
+    assert _limitacoes(e) == []
+
+
+def test_fase_servico_falha_dependente_do_ambiente_fora_do_alvo_vira_nao_testavel(sprint_servico):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"checagens": [_ECO_QUEBRADO_DEPENDE]})
+    fase_servico.cmd_servico(Args())
+    r = catalogo.carregar_resultados(e.pasta)
+    assert r[("servico/eco", "main")]["resultado"] == "nao_testavel"
+    assert "não rodou no ambiente do próprio alvo" in r[("servico/eco", "main")]["motivo"]
+    brutos = e.pasta / "achados-brutos"
+    assert not (brutos.exists() and list(brutos.glob("*.json")))
+    from maw_agent import bancada
+    assert bancada.carregar(e.pasta)["b-eco"]["estado"] == "pulei"
+
+
+def test_fase_servico_falha_dependente_do_ambiente_no_proprio_alvo_e_achado(sprint_servico, monkeypatch):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"checagens": [_ECO_QUEBRADO_DEPENDE]})
+    monkeypatch.setattr(servico, "escolher_ambiente",
+                        lambda nome, pasta, candidatos=(), **kw: servico.AmbienteServico(Path(sys.executable), True))
+    fase_servico.cmd_servico(Args())
+    r = catalogo.carregar_resultados(e.pasta)
+    assert r[("servico/eco", "main")]["resultado"] == "falhou"
+    assert (e.pasta / "achados-brutos" / "servico-main-eco-quebrado.json").exists()
+
+
+_CMD_REQUISITOS = {"id": "cli-dos-pacotes", "itens_catalogo": ["servico/eco"],
+                   "argumentos": ["-c", "import sys; print('quebrou no import'); sys.exit(3)"],
+                   "esperado": "a CLI roda no ambiente montado pelos requisitos do alvo",
+                   "depende_do_ambiente": True, "julga_requisitos": True}
+
+
+def test_fase_servico_comando_dos_requisitos_insatisfaziveis_continua_achado(sprint_servico, monkeypatch):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"comandos": [_CMD_REQUISITOS]})
+    lim = "main: os requisitos do alvo (requirements.txt) são insatisfazíveis — sem solução; ambiente comum"
+    monkeypatch.setattr(servico, "escolher_ambiente", lambda nome, pasta, candidatos=(), **kw:
+                        servico.AmbienteServico(Path(sys.executable), False, None, True, lim))
+    fase_servico.cmd_servico(Args())
+    ach = json.loads((e.pasta / "achados-brutos" / "servico-main-cli-dos-pacotes.json").read_text(encoding="utf-8"))
+    assert "insatisfazíveis" in ach["obtido"] and "código de saída 3" in ach["obtido"]
+    from maw_agent import achados as achados_mod
+    assert achados_mod.validar(ach) == []
+    assert any("insatisfazíveis" in l for l in _limitacoes(e))
+
+
+def test_fase_servico_comando_fora_do_ambiente_nao_montado_vira_nao_testavel(sprint_servico):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"comandos": [_CMD_REQUISITOS]})
+    fase_servico.cmd_servico(Args())
+    r = catalogo.carregar_resultados(e.pasta)
+    assert r[("servico/eco", "main")]["resultado"] == "nao_testavel"
+    assert not (e.pasta / "achados-brutos" / "servico-main-cli-dos-pacotes.json").exists()
+
+
+_PORTA_DOC = {"id": "porta-documentada", "itens_catalogo": ["servico/eco"], "porta": "servico",
+              "aberta_esperada": True,
+              "documentacao": [{"arquivos": ["LEIAME.md"], "padrao": r"na porta \**(\d+)"}]}
+
+
+def test_fase_servico_porta_do_servico_igual_a_documentada_passa(sprint_servico):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"portas": [_PORTA_DOC]})
+    (config.ALVOS_DIR / "main" / "LEIAME.md").write_text(f"escuta na porta **{sprint_servico['porta']}**",
+                                                          encoding="utf-8")
+    fase_servico.cmd_servico(Args())
+    assert catalogo.carregar_resultados(e.pasta)[("servico/eco", "main")]["resultado"] == "passou"
+
+
+def test_fase_servico_porta_documentada_diferente_e_achado(sprint_servico):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"portas": [_PORTA_DOC]})
+    (config.ALVOS_DIR / "main" / "LEIAME.md").write_text("escuta na porta **1**", encoding="utf-8")
+    fase_servico.cmd_servico(Args())
+    assert catalogo.carregar_resultados(e.pasta)[("servico/eco", "main")]["resultado"] == "falhou"
+    ach = json.loads((e.pasta / "achados-brutos" / "servico-main-porta-documentada.json").read_text(encoding="utf-8"))
+    assert "documenta a porta 1" in ach["obtido"] and str(sprint_servico["porta"]) in ach["obtido"]
+
+
+def test_fase_servico_documentacao_sem_porta_vira_nao_testavel(sprint_servico):
+    e = sprint_servico["estado"]
+    _reescrever_cenarios({"portas": [_PORTA_DOC]})
+    fase_servico.cmd_servico(Args())
+    r = catalogo.carregar_resultados(e.pasta)[("servico/eco", "main")]
+    assert r["resultado"] == "nao_testavel" and "não cita a porta" in r["motivo"]
+
+
+class ArgsAmbientes:
+    def __init__(self, alvo=None, listar=False, forcar=False):
+        self.acao, self.alvo, self.listar, self.forcar = "ambientes", alvo, listar, forcar
+
+
+def test_servico_ambientes_listar_mostra_a_escolha_sem_montar(sprint_servico, monkeypatch, capsys):
+    monkeypatch.setattr(servico, "montar_ambiente", lambda *a, **k: pytest.fail("--listar não monta nada"))
+    codigo = fase_servico.cmd_servico(ArgsAmbientes(listar=True))
+    saida = json.loads(capsys.readouterr().out)
+    assert codigo == 0
+    assert [a["alvo"] for a in saida["ambientes"]] == ["main"]  # docs-z compartilha a árvore com main
+    assert saida["ambientes"][0]["proprio"] is False and "não tem arquivo de requisitos" in saida["ambientes"][0]["limitacao"]
+
+
+def test_servico_ambientes_monta_pelos_requisitos_do_yaml(sprint_servico, monkeypatch, capsys):
+    _reescrever_cenarios({"ambiente": {"requisitos": ["trava/lock.txt", "requirements.txt"], "python": "3.10"}})
+    chamadas = []
+
+    def montar(nome, pasta_alvo, candidatos, **kw):
+        chamadas.append((nome, tuple(candidatos), kw.get("versao_python"), kw.get("forcar")))
+        return {"alvo": nome, "feito": False, "ok": False, "motivo": "falso"}
+
+    monkeypatch.setattr(servico, "montar_ambiente", montar)
+    codigo = fase_servico.cmd_servico(ArgsAmbientes(forcar=True))
+    saida = json.loads(capsys.readouterr().out)
+    assert chamadas == [("main", ("trava/lock.txt", "requirements.txt"), "3.10", True)]
+    assert codigo == 1 and saida["ambientes"][0]["proprio"] is False  # ficou sem ambiente próprio: falha
+
+
 def test_fase_servico_achado_invalido_nao_e_gravado_e_vira_limitacao(sprint_servico, monkeypatch):
     """Um achado que não passa no próprio esquema é erro do agente (regra 5 da constituição): vira
     limitação, nunca uma ficha ruim no disco."""
@@ -681,8 +1101,10 @@ def test_real_pipeline_roda_de_ponta_a_ponta_sem_excecao(tmp_path):
             assert isinstance(ok, bool) and isinstance(problemas, list)
             algum_resultado = True
         for chk in _DADOS_PRIVADOS["portas"]:
-            aberta = servico.porta_aberta(chk.porta)
-            ok, problemas = servico.avaliar_porta(chk, aberta)
+            porta = servico.resolver_porta(chk, app.porta)
+            aberta = servico.porta_aberta(porta)
+            documentadas, _sem = servico.portas_documentadas(ALVO_MAIN, chk.documentacao)
+            ok, problemas = servico.avaliar_porta(chk, aberta, porta=porta, documentadas=documentadas)
             assert isinstance(ok, bool) and isinstance(problemas, list)
             algum_resultado = True
     assert algum_resultado  # sanidade do próprio teste: o YAML privado não está vazio
