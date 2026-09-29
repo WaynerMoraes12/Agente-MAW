@@ -9,8 +9,9 @@ from pathlib import Path
 
 from . import config, sandbox
 
+# o que da raiz é código (a documentação fica de fora); todo script .py da raiz também conta
 CAMINHOS_DE_CODIGO = ("Source", "Builds", "JuceLibraryCode", "MAW_APP.jucer",
-                      "server_mapp.py", "requirements.txt", "pretrained_models")
+                      "requirements.txt", "pretrained_models")
 
 
 @dataclass(frozen=True)
@@ -91,9 +92,17 @@ def _e_ancestral(espelho: Path, a: str, b: str) -> bool:
     return _rodar_git(["git", "merge-base", "--is-ancestor", a, b], espelho).returncode == 0
 
 
+def _caminhos_de_codigo(espelho: Path, commit: str) -> list[str]:
+    try:
+        raiz = git(["ls-tree", "--name-only", commit], espelho).splitlines()
+    except RuntimeError:
+        raiz = []
+    return list(CAMINHOS_DE_CODIGO) + sorted(n for n in raiz if n.endswith(".py") and n not in CAMINHOS_DE_CODIGO)
+
+
 def _assinatura(espelho: Path, commit: str) -> str:
     h = hashlib.sha256()
-    for c in CAMINHOS_DE_CODIGO:
+    for c in _caminhos_de_codigo(espelho, commit):
         try:
             h.update(f"{c}={git(['rev-parse', f'{commit}:{c}'], espelho)}\n".encode())
         except RuntimeError:

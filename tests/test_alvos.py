@@ -236,3 +236,16 @@ def test_prova_de_pasta_sem_git_por_lista_de_arquivos(tmp_path):
 
 def test_prova_vazia_nao_e_verificada():
     assert alvos.comparar_provas({}, {}) == ["nenhuma pasta da MAW encontrada para provar"]
+
+
+def test_script_python_da_raiz_conta_como_codigo(mundo):
+    """Todo script .py da raiz (ex.: o serviço de IA) entra na assinatura da árvore, sem nome fixo."""
+    sh("checkout", "-qb", "feature/servico", cwd=mundo["origem"]); commit(mundo["origem"], "servico_x.py", "p", "s")
+    sh("push", "-q", str(mundo["bare"]), "feature/servico", cwd=mundo["origem"])
+    sh("checkout", "-q", "main", cwd=mundo["origem"])
+    sh("checkout", "-qb", "docs/w", cwd=mundo["origem"]); commit(mundo["origem"], "LEIAME.md", "w", "w")
+    sh("push", "-q", str(mundo["bare"]), "docs/w", cwd=mundo["origem"])
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    por_nome = {a.nome: a for a in alvos.descobrir_alvos(esp, [])[0]}
+    assert por_nome["feature-servico"].compartilha_com is None
+    assert por_nome["docs-w"].compartilha_com == "main"
