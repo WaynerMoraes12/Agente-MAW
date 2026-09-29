@@ -995,18 +995,28 @@ def rodar(op: Opcoes, *, executar: Callable = executar_etapa, agora: Callable[[]
             from .cli import _SUBCOMANDOS  # a própria CLI já carregou tudo o que existe
             disponiveis = set(_SUBCOMANDOS)
             reg.linha("--help-json ilegível: usando os subcomandos desta própria execução")
+        conf = _seguro(confianca)
+        # só um "não" certo desliga o julgamento: None (~/.claude.json ilegível por um instante, por ex.
+        # gravado por uma sessão aberta) não tira o julgamento da noite
+        sem_confianca = conf is False and not op.sem_julgamento
+        if sem_confianca:
+            op = replace(op, sem_julgamento=True)
+            reg.linha("workspace sem confiança no Claude Code: rodando sem julgamento (o `claude -p` só "
+                      "falharia)")
         acoes, lims = planejar(op, disponiveis, inicio.date(), py, cl,
                                _tem_sondas() if tem_sondas is None else tem_sondas)
+        if sem_confianca:
+            lims.insert(0, MSG_SEM_CONFIANCA)
         if op.ensaio:
             return _ensaio(reg, executar, env, raiz, cl, disponiveis, acoes, lims,
                            verificar or _preflight_sem_sprint, status or status_tarefa, confianca, sessao)
-        conf = _seguro(confianca)
         reg.linha(f"confiança do workspace no Claude Code: {_sim_nao(conf)}"
                   + ("" if conf else " (o `claude -p` ignoraria as permissões do projeto)"))
         manter_acordado(True)
         try:
             noite = _Noite(op, reg, executar, env, raiz, py, lims, real, prazo,
-                           prazo_final - timedelta(seconds=RESERVA_RELATORIO), agora, sessao, volume, ocioso)
+                           prazo_final - timedelta(seconds=RESERVA_RELATORIO), agora, sessao, volume, ocioso,
+                           sem_confianca=sem_confianca)
             return noite.tudo(acoes)
         finally:
             manter_acordado(False)
@@ -1035,6 +1045,8 @@ def _preflight_sem_sprint():
 
 
 MSG_CONFIANCA = "aceite a confiança do workspace: rode `claude` uma vez nesta pasta"
+MSG_SEM_CONFIANCA = ("o workspace não é confiável para o Claude Code: o julgamento não rodou pelo claude -p "
+                     "(rode `claude` uma vez na pasta e aceite; ou o julgamento é feito pela sessão interativa)")
 
 
 def _ensaio(reg, executar, env, raiz, cl, disponiveis, acoes, lims, verificar, status, confianca, sessao) -> int:
@@ -1105,8 +1117,9 @@ class _Noite:
     """A sequência da noite, com o que ela lembra no caminho (sprint, limitações, julgamentos, prazos)."""
 
     def __init__(self, op, reg, executar, env, raiz, py, lims, real, prazo, corte, agora, sessao, volume,
-                 ocioso=segundos_ocioso):
+                 ocioso=segundos_ocioso, sem_confianca: bool = False):
         self.op, self.reg, self._executar, self.env, self.raiz = op, reg, executar, env, raiz
+        self.sem_confianca = sem_confianca  # sem julgamento por falta de confiança, não pela opção
         self.ma = [py, "-m", "maw_agent"]
         self.real, self.prazo, self.corte, self.agora, self.sessao = real, prazo, corte, agora, sessao
         self.ocioso = ocioso
@@ -1296,8 +1309,9 @@ class _Noite:
     def rede_de_seguranca(self, e: estado.Estado) -> None:
         """O julgamento não chegou ao PDF: o script consolida, encerra e gera o relatório com o que há."""
         if self.op.sem_julgamento:
-            self.limitar("execução sem as fases de julgamento (-SemJulgamento): sem catálogo, revisão de código, "
-                         "verificação adversarial nem textos; o relatório saiu só com as fases mecânicas")
+            if not self.sem_confianca:  # sem confiança, a causa já foi declarada no começo (MSG_SEM_CONFIANCA)
+                self.limitar("execução sem as fases de julgamento (-SemJulgamento): sem catálogo, revisão de "
+                             "código, verificação adversarial nem textos; o relatório saiu só com as fases mecânicas")
         else:
             if self.falhas_julgamento:
                 motivo = " | ".join(self.falhas_julgamento)

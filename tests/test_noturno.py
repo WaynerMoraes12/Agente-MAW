@@ -615,11 +615,12 @@ class VolumeFalso:
 
 
 def _rodar(tmp_path, falso, op=None, agora=datetime(2026, 9, 28, 22, 0), sessao=lambda: False, volume=None,
-           ocioso=lambda: 3600.0):
+           ocioso=lambda: 3600.0, confianca=lambda: True):
+    """`confianca` falsa por padrão: a noite dos testes nunca depende do ~/.claude.json de verdade."""
     relogio = agora if callable(agora) else (lambda: agora)
     return N.rodar(op or N.Opcoes(), executar=falso, agora=relogio, logs=tmp_path / "logs", python="py",
                    claude="claude.exe", tem_sondas=False, manter_acordado=lambda _: None, sessao=sessao,
-                   volume=volume or (lambda: None), ocioso=ocioso)
+                   volume=volume or (lambda: None), ocioso=ocioso, confianca=confianca)
 
 
 def _lims(pasta, origem="noturno"):
@@ -1024,3 +1025,47 @@ def test_bancada_desativada_nao_envia_nem_registra_limitacao(tmp_path, monkeypat
     saida = json.loads(capsys.readouterr().out)
     assert saida["desativada"] is True and "lotes" not in saida
     assert not (pasta / "limitacoes-bancada.json").exists()
+
+
+
+# ---------- workspace sem confiança: a noite roda sem julgamento ----------
+
+def test_workspace_sem_confianca_roda_sem_julgamento_e_diz_por_que(tmp_path):
+    """O `claude -p` num workspace não confiável só pode falhar: nem começa."""
+    pasta = _sprint(tmp_path)
+    falso = Falso(pasta)
+    _rodar(tmp_path, falso, confianca=lambda: False)
+    o = falso.ordem
+    assert not any(n.startswith("julgamento") for n in o)
+    assert {"compilar", "suite", "e2e", "servico"} <= set(o)
+    assert o[-3:] == ["consolidar", "encerrar", "relatorio"]  # a rede de segurança faz o PDF
+    assert not any(n.startswith("privado") for n in o)  # como no -SemJulgamento: fica só no PC
+    lims = _lims(pasta)
+    assert N.MSG_SEM_CONFIANCA in lims
+    assert "rode `claude` uma vez na pasta e aceite" in N.MSG_SEM_CONFIANCA
+    assert not any("-SemJulgamento" in l for l in lims)  # a causa é a confiança, não a opção
+    assert "rodando sem julgamento" in (tmp_path / "logs" / "2026-09-28.log").read_text(encoding="utf-8")
+
+
+def test_confianca_desconhecida_nao_desliga_o_julgamento(tmp_path):
+    """~/.claude.json ilegível por um instante (outra sessão gravando) não tira o julgamento da noite."""
+    pasta = _sprint(tmp_path)
+    falso = Falso(pasta, ao_rodar=_julgamento_ok(pasta))
+    _rodar(tmp_path, falso, confianca=lambda: None)
+    assert "julgamento-revisao" in falso.ordem and "julgamento-final" in falso.ordem
+    assert N.MSG_SEM_CONFIANCA not in _lims(pasta)
+
+
+def test_sem_julgamento_pedido_nao_ganha_a_limitacao_da_confianca(tmp_path):
+    pasta = _sprint(tmp_path)
+    falso = Falso(pasta)
+    _rodar(tmp_path, falso, N.Opcoes(sem_julgamento=True), confianca=lambda: False)
+    lims = _lims(pasta)
+    assert N.MSG_SEM_CONFIANCA not in lims and any("-SemJulgamento" in l for l in lims)
+
+
+def test_ensaio_sem_confianca_mostra_a_noite_sem_julgamento(tmp_path, capsys):
+    assert _ensaio(tmp_path, Falso(_sprint(tmp_path)), confianca=lambda: False) == 1
+    saida = json.loads(capsys.readouterr().out)
+    assert not any("julgamento" in p for p in saida["plano"])
+    assert N.MSG_SEM_CONFIANCA in saida["limitacoes"]
