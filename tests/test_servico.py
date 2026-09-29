@@ -36,6 +36,14 @@ def test_detectar_porta_literal_no_app_run(tmp_path):
     assert servico.detectar_porta(p) == 5000
 
 
+def test_detectar_porta_com_host_e_outros_argumentos(tmp_path):
+    p = tmp_path / NOME_SCRIPT_FALSO
+    p.write_text('PORTA = 5057\nHOST = "127.0.0.1"\napp.run(host=HOST, port=PORTA)\n', encoding="utf-8")
+    assert servico.detectar_porta(p) == 5057
+    p.write_text("app.run(host='127.0.0.1', port=5057, debug=False)\n", encoding="utf-8")
+    assert servico.detectar_porta(p) == 5057
+
+
 def test_detectar_porta_sem_app_run_usa_padrao(tmp_path):
     p = tmp_path / NOME_SCRIPT_FALSO
     p.write_text("print('nada de servidor aqui')\n", encoding="utf-8")

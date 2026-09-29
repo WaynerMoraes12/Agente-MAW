@@ -40,7 +40,7 @@ PORTA_PADRAO = 5000  # o que o Flask abriria sem nenhum app.run(port=...) reconh
 PYTHON_SERVICO_PADRAO = config.WORK / "py310" / "Scripts" / "python.exe"
 FFMPEG_BIN_PADRAO = config.FERRAMENTAS / "ffmpeg" / "bin"
 
-_RX_APP_RUN = re.compile(r"app\.run\(\s*port\s*=\s*(\w+)\s*\)")
+_RX_APP_RUN = re.compile(r"app\.run\([^)]*?\bport\s*=\s*(\w+)")
 _RX_CONST_INT = re.compile(r"(?m)^\s*(\w+)\s*=\s*(\d+)\s*(?:#.*)?$")
 
 # Qualquer variável de ambiente que pareça uma credencial nunca chega ao processo filho — genérico
