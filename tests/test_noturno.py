@@ -468,6 +468,9 @@ def test_workspace_confiavel_le_so_a_marca_do_projeto(tmp_path):
     assert N.workspace_confiavel(raiz, arq) is False
     arq.write_text(json.dumps({"projects": {"C:/Outro": {"hasTrustDialogAccepted": True}}}), encoding="utf-8")
     assert N.workspace_confiavel(raiz, arq) is False
+    # uma pasta acima confiável NÃO basta: o claude -p exige a entrada do próprio projeto
+    arq.write_text(json.dumps({"projects": {"C:/X": {"hasTrustDialogAccepted": True}}}), encoding="utf-8")
+    assert N.workspace_confiavel(raiz, arq) is False
     assert N.workspace_confiavel(raiz, tmp_path / "nao-existe.json") is None
     arq.write_text("{quebrado", encoding="utf-8")
     assert N.workspace_confiavel(raiz, arq) is None

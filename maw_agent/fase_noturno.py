@@ -635,8 +635,10 @@ def marcas_faltando(nome: str, e: estado.Estado) -> list[str]:
 
 
 def workspace_confiavel(raiz: Path, arquivo: Path | None = None) -> bool | None:
-    """Só a marca `hasTrustDialogAccepted` do projeto (ou de uma pasta acima dele) em `~/.claude.json`.
-    Nada mais desse arquivo é devolvido, impresso ou gravado. None = arquivo ausente ou ilegível."""
+    """Só a marca `hasTrustDialogAccepted` da entrada do PRÓPRIO projeto em `~/.claude.json` — o
+    `claude -p` exige essa entrada exata: uma pasta acima confiável não basta (medido na noite de 28/09:
+    o ensaio dizia "sim" por causa de uma pasta-mãe e o `claude -p` ignorou as permissões). Nada mais
+    desse arquivo é devolvido, impresso ou gravado. None = arquivo ausente ou ilegível."""
     arquivo = Path(arquivo) if arquivo else Path.home() / ".claude.json"
     try:
         dados = json.loads(arquivo.read_text(encoding="utf-8"))
@@ -647,11 +649,7 @@ def workspace_confiavel(raiz: Path, arquivo: Path | None = None) -> bool | None:
         return False
     norm = lambda c: str(c).replace("\\", "/").rstrip("/").casefold()
     marcas = {norm(k): bool(isinstance(v, dict) and v.get("hasTrustDialogAccepted")) for k, v in projetos.items()}
-    atual = Path(raiz)
-    for pasta in (atual, *atual.parents):
-        if marcas.get(norm(pasta)):
-            return True
-    return False
+    return bool(marcas.get(norm(Path(raiz))))
 
 
 OCIOSO_MINIMO = 15 * 60  # teclado/mouse reais só com o PC parado há pelo menos isso
