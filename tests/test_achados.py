@@ -78,3 +78,61 @@ def test_historico_ida_e_volta(tmp_path):
     achados.salvar_historico(tmp_path / "h.json", h)
     assert achados.carregar_historico(tmp_path / "h.json") == h
     assert achados.carregar_historico(tmp_path / "nao.json") == {"proximo": 1, "itens": {}}
+
+
+# ---------- alvo removido: a branch do achado foi apagada ----------
+
+def _so_em(alvo, assinatura):
+    return base(alvos=[{"alvo": alvo, "commit": "c0"}], assinatura=assinatura)
+
+
+def test_alvo_removido_so_sem_reverificacao_e_com_todos_os_alvos_removidos():
+    """Nomes sintéticos do caso real: `feature-apagada` sumiu do origin; `feature-mesclada` ainda existe no
+    origin (já mesclada, fora dos alvos desta sprint) e segue a regra normal; o main é o único alvo."""
+    h = {"proximo": 1, "itens": {}}
+    brutos = [_so_em("feature-apagada", "sem-veredito"), _so_em("feature-apagada", "corrigido-no-main"),
+              _so_em("feature-apagada", "nao-verificado"), _so_em("feature-apagada", "persiste-no-main"),
+              _so_em("feature-mesclada", "branch-ainda-existe"),
+              base(alvos=[{"alvo": "feature-apagada", "commit": "c0"}, {"alvo": "main", "commit": "c1"}],
+                   assinatura="tambem-no-main")]
+    l, h = achados.consolidar(brutos, h, "01", {})
+    ids = {a["assinatura"]: a["id"] for a in l}
+    rever = {ids["corrigido-no-main"]: "corrigido", ids["nao-verificado"]: "nao_verificavel",
+             ids["persiste-no-main"]: "persiste"}
+    principal = {"alvo": "main", "commit": "m2"}
+    l, h = achados.consolidar([], h, "02", rever, alvos_removidos={"feature-apagada"}, alvo_principal=principal)
+    por = {a["assinatura"]: a for a in l}
+    assert por["sem-veredito"]["estado"] == "alvo_removido"
+    assert por["sem-veredito"]["estado_anterior"] == "novo"
+    # a reverificação vence sempre (o código da branch pode ter entrado no main antes de ela ser apagada)
+    assert por["corrigido-no-main"]["estado"] == "corrigido"
+    assert por["nao-verificado"]["estado"] == "nao_verificavel"
+    assert por["persiste-no-main"]["estado"] == "aberto"
+    assert principal in por["persiste-no-main"]["alvos"]  # continua no main: o main entra nos alvos
+    imp = achados.impressao_digital(por["persiste-no-main"])
+    assert principal in h["itens"][imp]["ultimo"]["alvos"]  # e fica no histórico para as próximas sprints
+    assert por["branch-ainda-existe"]["estado"] == "nao_verificavel"
+    assert por["tambem-no-main"]["estado"] == "nao_verificavel"  # nem todos os alvos foram removidos
+    assert "alvo_removido" in achados.ESTADOS
+
+
+def test_alvo_removido_e_terminal_e_reaparecer_reabre_como_aberto():
+    h = {"proximo": 1, "itens": {}}
+    _, h = achados.consolidar([_so_em("feature-apagada", "x")], h, "01", {})
+    [a], h = achados.consolidar([], h, "02", {}, alvos_removidos={"feature-apagada"})
+    assert a["estado"] == "alvo_removido"
+    l, h = achados.consolidar([], h, "03", {}, alvos_removidos={"feature-apagada"})
+    assert l == []  # como o corrigido: é notícia só na sprint em que acontece
+    l, h = achados.consolidar([], h, "04", {})
+    assert l == []  # mesmo que o nome volte a não constar como removido
+    # a mesma impressão digital volta (branch recriada ou o defeito no main): não é regressão, nunca foi corrigido
+    [b], h = achados.consolidar([_so_em("main", "x")], h, "05", {})
+    assert b["id"] == a["id"] and b["estado"] == "aberto" and b["estado_anterior"] == "alvo_removido"
+
+
+def test_alvo_removido_reconsolidado_na_mesma_sprint_continua_na_lista():
+    h = {"proximo": 1, "itens": {}}
+    _, h = achados.consolidar([_so_em("feature-apagada", "x")], h, "01", {})
+    _, h = achados.consolidar([], h, "02", {}, alvos_removidos={"feature-apagada"})
+    [a], _ = achados.consolidar([], h, "02", {}, alvos_removidos={"feature-apagada"})
+    assert a["estado"] == "alvo_removido"

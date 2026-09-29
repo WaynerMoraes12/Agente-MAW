@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+from collections.abc import Collection
 from pathlib import Path
 
 import jsonschema
@@ -14,7 +15,10 @@ TIPOS = ("erro", "bug", "violacao", "afirmacao_falsa", "lacuna", "melhoria")
 SEVERIDADES = ("critica", "alta", "media", "baixa")
 PRIORIDADES = ("alta", "media", "baixa")
 CONFIANCAS = ("confirmado", "provavel")
-ESTADOS = ("novo", "aberto", "corrigido", "regressao", "nao_verificavel")
+ESTADOS = ("novo", "aberto", "corrigido", "regressao", "nao_verificavel", "alvo_removido")
+# notícia só na sprint em que acontecem; nas seguintes, o achado não visto fica fora da lista
+ESTADOS_TERMINAIS = ("corrigido", "alvo_removido")
+_DO_VEREDITO = {"corrigido": "corrigido", "persiste": "aberto", "nao_verificavel": "nao_verificavel"}
 ORDEM_SEVERIDADE = {s: i for i, s in enumerate(SEVERIDADES)}
 _ESQUEMA = json.loads((Path(__file__).parent / "esquemas" / "achado.schema.json").read_text(encoding="utf-8"))
 
@@ -82,9 +86,17 @@ def salvar_historico(p: Path, h: dict) -> None:
     sandbox.escrever_json(Path(p), h)
 
 
-def consolidar(achados: list[dict], historico: dict, sprint: str,
-               reverificacoes: dict[str, str]) -> tuple[list[dict], dict]:
+def consolidar(achados: list[dict], historico: dict, sprint: str, reverificacoes: dict[str, str],
+               alvos_removidos: Collection[str] = (), alvo_principal: dict | None = None) -> tuple[list[dict], dict]:
+    """Junta os achados desta sprint ao histórico. Um achado do histórico não visto nesta sprint fica com
+    o que a reverificação disser (ela vence sempre); sem reverificação, vira `alvo_removido` quando todos
+    os seus alvos estão em `alvos_removidos` (a branch foi apagada do origin), senão `nao_verificavel`.
+    `persiste` num achado de alvos todos removidos só pode ter sido visto no `alvo_principal` (o main,
+    para onde o código da branch foi antes de ela ser apagada): ele entra nos alvos do achado.
+    `alvo_removido` é terminal como `corrigido`; se a mesma impressão digital voltar a aparecer, o achado
+    reabre como `aberto` — não `regressao`, porque ele nunca foi corrigido, só a branch sumiu."""
     h = copy.deepcopy(historico)
+    removidos = set(alvos_removidos)
     vivos = [a for a in achados if (a.get("veredito") or {}).get("resultado") != "derrubado"]
     saida: list[dict] = []
     vistos: set[str] = set()
@@ -96,7 +108,7 @@ def consolidar(achados: list[dict], historico: dict, sprint: str,
             reg = {"id": f"MAW-{h['proximo']:04d}", "historico": []}
             h["proximo"] += 1
             estado = "novo"
-        else:
+        else:  # reaparecer depois de alvo_removido também é "aberto"
             estado = "regressao" if reg.get("estado") == "corrigido" else "aberto"
         reg["estado_anterior"] = reg.get("estado")
         reg["historico"] = reg["historico"] + [sprint]
@@ -108,11 +120,18 @@ def consolidar(achados: list[dict], historico: dict, sprint: str,
         if imp in vistos:
             continue
         anterior = reg.get("estado")
-        if anterior == "corrigido":
+        if anterior in ESTADOS_TERMINAIS:
             if reg.get("sprint_do_estado") != sprint:
-                continue  # corrigido numa sprint anterior: não é notícia
+                continue  # corrigido (ou alvo removido) numa sprint anterior: não é notícia
         rv = reverificacoes.get(reg["id"])
-        novo = {"corrigido": "corrigido", "persiste": "aberto"}.get(rv, "nao_verificavel")
+        alvos_do_achado = reg["ultimo"].get("alvos", [])
+        todos_removidos = bool(alvos_do_achado) and {x["alvo"] for x in alvos_do_achado} <= removidos
+        if rv in _DO_VEREDITO:
+            novo = _DO_VEREDITO[rv]
+            if novo == "aberto" and todos_removidos and alvo_principal and alvo_principal not in alvos_do_achado:
+                reg["ultimo"] = {**reg["ultimo"], "alvos": alvos_do_achado + [dict(alvo_principal)]}
+        else:
+            novo = "alvo_removido" if todos_removidos else "nao_verificavel"
         reg["historico"] = reg["historico"] + [sprint]
         reg.update({"estado": novo, "estado_anterior": anterior, "sprint_do_estado": sprint})
         saida.append({**reg["ultimo"], "id": reg["id"], "estado": novo, "historico": reg["historico"],
