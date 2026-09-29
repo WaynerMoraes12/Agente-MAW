@@ -985,3 +985,24 @@ def test_e2e_oculta_tambem_e_cortada_no_limite_da_manha(tmp_path):
     falso = Falso(pasta, ao_rodar=_julgamento_ok(pasta))
     _rodar(tmp_path, falso, agora=datetime(2026, 9, 29, 6, 30), sessao=lambda: True)
     assert falso.limites["e2e"] <= 31 * 60
+
+
+
+def test_lotes_bancada_item_so_de_linux_ou_mac_vai_para_o_sistema_dele():
+    dados = {"abrir": {"estado": "passou", "nota": "ok", "alvo": "main"},
+             "l-audio": {"estado": "pulei", "nota": "exige Linux", "alvo": "main"},
+             "projeto-windows": {"estado": "pulei", "nota": "exige Linux/macOS", "alvo": "main"}}
+    plats = {"abrir": ["windows", "linux", "macos"], "l-audio": ["linux"], "projeto-windows": ["linux", "macos"]}
+    lotes, ignorados = N.lotes_bancada(dados, "s", "t", plataformas=plats)
+    ids = sorted(w["doc_id"] for l in lotes for w in l)
+    assert ids == ["abrir__windows__agente", "l-audio__linux__agente",
+                   "projeto-windows__linux__agente", "projeto-windows__macos__agente"]
+    assert all(w["data"]["plataforma"] == w["doc_id"].split("__")[1] for l in lotes for w in l)
+    assert ignorados == []
+
+
+def test_plataformas_da_bancada_le_a_copia_local(tmp_path):
+    (tmp_path / "x.json").write_text('{"plataformas": ["linux"]}', encoding="utf-8")
+    (tmp_path / "y.json").write_text("{quebrado", encoding="utf-8")
+    assert N.plataformas_da_bancada(tmp_path) == {"x": ["linux"]}
+    assert N.plataformas_da_bancada(tmp_path / "nao-existe") == {}

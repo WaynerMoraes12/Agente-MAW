@@ -359,9 +359,26 @@ def _nota_bancada(nota, sprint: str, alvo) -> str:
     return f"{base} {origem}" if base else origem
 
 
-def lotes_bancada(dados: dict, sprint: str, em: str, tam: int = TAM_LOTE) -> tuple[list[list[dict]], list[str]]:
+def plataformas_da_bancada(pasta: Path | None = None) -> dict[str, list[str]]:
+    """`{código: [plataformas]}` a partir da cópia local da bancada (`work/bancada/testes/<código>.json`).
+    Ausente ou ilegível: dicionário vazio (todo código vai como `windows`)."""
+    pasta = Path(pasta) if pasta else config.WORK / "bancada" / "testes"
+    saida: dict[str, list[str]] = {}
+    for arq in sorted(pasta.glob("*.json")) if pasta.is_dir() else []:
+        try:
+            plats = json.loads(arq.read_text(encoding="utf-8")).get("plataformas") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        saida[arq.stem] = [p for p in plats if p in ("windows", "linux", "macos")]
+    return saida
+
+
+def lotes_bancada(dados: dict, sprint: str, em: str, tam: int = TAM_LOTE,
+                  plataformas: dict[str, list[str]] | None = None) -> tuple[list[list[dict]], list[str]]:
     """`{código: {estado, nota, alvo}}` → lotes de escritas `set` para o `ArtifactData` (ação `batch`),
-    no formato da página: `resultados/<código>__windows__agente`."""
+    no formato da página: `resultados/<código>__<sistema>__agente`. O sistema é `windows` quando o item vale
+    para o Windows; um item só de Linux e/ou macOS vai para cada um desses sistemas (esta máquina é Windows,
+    então ali ele é sempre `pulei`)."""
     escritas: list[dict] = []
     ignorados: list[str] = []
     for codigo in sorted(dados):
@@ -373,9 +390,12 @@ def lotes_bancada(dados: dict, sprint: str, em: str, tam: int = TAM_LOTE) -> tup
         if not _RX_CODIGO.fullmatch(codigo) or "__" in codigo or codigo in (".", ".."):
             ignorados.append(f"{codigo!r}: código inválido para a bancada")
             continue
-        escritas.append({"op": "set", "collection": COLECAO_BANCADA, "doc_id": f"{codigo}__windows__agente",
-                         "data": {"teste": codigo, "plataforma": "windows", "quem": "agente", "estado": est,
-                                  "nota": _nota_bancada(r.get("nota"), sprint, r.get("alvo")), "em": em}})
+        plats = (plataformas or {}).get(codigo) or ["windows"]
+        for plat in (["windows"] if "windows" in plats else plats):
+            escritas.append({"op": "set", "collection": COLECAO_BANCADA, "doc_id": f"{codigo}__{plat}__agente",
+                             "data": {"teste": codigo, "plataforma": plat, "quem": "agente",
+                                      "estado": est if plat == "windows" else "pulei",
+                                      "nota": _nota_bancada(r.get("nota"), sprint, r.get("alvo")), "em": em}})
     return [escritas[i:i + tam] for i in range(0, len(escritas), tam)], ignorados
 
 
@@ -407,7 +427,7 @@ def _bancada(args) -> int:
                  "(privado/bancada/config.yaml, chave url, ou MAW_AGENTE_BANCADA_URL)")
         acrescentar_limitacao(pasta, texto, "bancada")
         return _saida({"ok": False, "motivo": texto}, False)
-    lotes, ignorados = lotes_bancada(dados, pasta.name, agora_iso())
+    lotes, ignorados = lotes_bancada(dados, pasta.name, agora_iso(), plataformas=plataformas_da_bancada())
     if ignorados:
         acrescentar_limitacao(pasta, f"{len(ignorados)} resultado(s) da bancada fora do formato, não enviados: "
                               + "; ".join(ignorados[:5]), "bancada")
