@@ -8,8 +8,10 @@ from collections import Counter
 from pathlib import Path
 
 from .. import calibracao, catalogo, config
+from ..achados import ESTADOS_TERMINAIS
 from ..estado import FASES, FINAL
 
+# alvo_removido (a branch do achado foi apagada) não está aberto: fica fora das fichas e do semáforo
 ABERTOS = ("novo", "aberto", "regressao", "nao_verificavel")
 _ROTULO_SEMAFORO = {"pronto": "Pronto para merge", "com_ressalvas": "Com ressalvas", "bloqueado": "Bloqueado"}
 
@@ -324,9 +326,10 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
     motivos = Counter(c["motivo"] for l in m.values() for c in l.values() if c["resultado"] == "nao_testavel")
     for motivo, n in motivos.most_common():
         limitacoes.append(f"{n} célula(s) não testável(is): {motivo or 'motivo não informado'}")
-    # fichas para o agente de correção: só o que está aberto; corrigidos ficam só na lista de corrigidos
-    problemas = [a for a in achados_lista if a["tipo"] != "melhoria" and a["estado"] != "corrigido"]
-    melhorias = [a for a in achados_lista if a["tipo"] == "melhoria" and a["estado"] != "corrigido"]
+    # fichas para o agente de correção: só o que está aberto; corrigidos e de alvo removido ficam só nas
+    # suas listas curtas
+    problemas = [a for a in achados_lista if a["tipo"] != "melhoria" and a["estado"] not in ESTADOS_TERMINAIS]
+    melhorias = [a for a in achados_lista if a["tipo"] == "melhoria" and a["estado"] not in ESTADOS_TERMINAIS]
     provaveis = [a for a in achados_lista if a.get("confianca") == "provavel"]
     if provaveis:
         limitacoes.append(f"{len(provaveis)} achado(s) marcado(s) como provável(is): evidentes no código, não reproduzidos dinamicamente")
@@ -340,7 +343,8 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         cels = [m.get(f"principio/{p['id']}", {}).get(n, {"resultado": "nao_testavel", "motivo": "sem item na matriz", "achados": []})
                 for n in nomes]
         principios_ctx.append({**p, "celulas": cels,
-                               "violacoes": [a["id"] for a in achados_lista if a.get("principio") == p["id"]]})
+                               "violacoes": [a["id"] for a in achados_lista if a.get("principio") == p["id"]
+                                             and a["estado"] != "alvo_removido"]})
     logo_uri = None
     if logo and Path(logo).exists():
         logo_uri = "data:image/png;base64," + base64.b64encode(Path(logo).read_bytes()).decode()
@@ -365,6 +369,7 @@ def montar(pasta: Path, itens: list[dict], principios: list[dict], anterior: Pat
         "melhorias": melhorias,
         "corrigidos": [a for a in achados_lista if a["estado"] == "corrigido"],
         "regressoes": [a for a in achados_lista if a["estado"] == "regressao"],
+        "alvo_removido": [a for a in achados_lista if a["estado"] == "alvo_removido"],
         "principios": principios_ctx,
         "matriz": {"alvos": nomes, "linhas": linhas},
         "cobertura": cobertura,

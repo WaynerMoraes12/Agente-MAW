@@ -471,3 +471,34 @@ def test_titulo_do_pdf_e_do_roadie(tmp_path):
     texto = "\n".join(p.extract_text() for p in leitor.pages)
     assert "Roadie" in texto and "relatório da Sprint 01" in texto and "agente de testes da MAW" in texto
     assert leitor.metadata.title == "Roadie — relatório da Sprint 01"
+
+
+# ---------- alvo removido: a branch do achado foi apagada ----------
+
+def test_alvo_removido_em_lista_propria_fora_das_fichas_e_do_semaforo(tmp_path):
+    s = _sprint(tmp_path)
+    (s / "builds").mkdir()
+    (s / "builds" / "feature-x-Release.json").write_text(json.dumps({"ok": True, "segundos": 1, "avisos": []}))
+    removido = dict(ACHADO, id="MAW-0011", estado="alvo_removido", titulo="Achado de branch <apagada>",
+                    alvos=[{"alvo": "feature-apagada", "commit": "c" * 40}], principio="P9")
+    removido_melhoria = dict(removido, id="MAW-0012", tipo="melhoria", prioridade="baixa", titulo="Melhoria antiga")
+    # o mesmo achado num alvo desta sprint não mexeria no semáforo: o estado já o deixa de fora
+    removido_no_alvo = dict(removido, id="MAW-0013", alvos=[{"alvo": "feature-x", "commit": "b" * 40}])
+    (s / "achados.json").write_text(json.dumps([removido, removido_melhoria, removido_no_alvo]))
+    ctx = contexto.montar(s, ITENS, [{"id": "P9", "titulo": "t"}], None, None)
+    assert ctx["achados"] == [] and ctx["melhorias"] == [] and ctx["top5"] == []
+    assert [a["id"] for a in ctx["alvo_removido"]] == ["MAW-0011", "MAW-0012", "MAW-0013"]
+    assert ctx["contagens"]["por_estado"] == {"alvo_removido": 3}
+    assert ctx["contagens"]["por_severidade"] == {}
+    assert {a["nome"]: a["semaforo"] for a in ctx["alvos"]}["feature-x"] == "pronto"
+    assert contexto.semaforo([dict(ACHADO, estado="alvo_removido")], True) == "pronto"
+    assert ctx["principios"][0]["violacoes"] == []  # a branch não existe mais: não é violação atual
+    html = pdf._html(ctx)
+    secao = html.split("Alvo removido (a branch foi apagada)", 1)[1].split("</section>", 1)[0]
+    assert "MAW-0011" in secao and "Achado de branch &lt;apagada&gt;" in secao and "feature-apagada" in secao
+    assert "MAW-0011" not in html.split("5. Achados", 1)[1].split("</section>", 1)[0]
+
+
+def test_sem_alvo_removido_a_lista_nao_aparece(tmp_path):
+    html = pdf._html(contexto.montar(_sprint(tmp_path), ITENS, [], None, None))
+    assert "Alvo removido (a branch foi apagada)" not in html

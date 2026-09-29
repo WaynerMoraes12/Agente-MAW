@@ -33,6 +33,7 @@
     <div class="cartao"><b>{{ contagens.por_estado.get('novo', 0) }}</b><span>novos</span></div>
     <div class="cartao"><b>{{ contagens.por_estado.get('corrigido', 0) }}</b><span>corrigidos</span></div>
     <div class="cartao"><b>{{ contagens.por_estado.get('regressao', 0) }}</b><span>regressões</span></div>
+    {% if contagens.por_estado.get('alvo_removido') %}<div class="cartao"><b>{{ contagens.por_estado.get('alvo_removido') }}</b><span>alvo removido</span></div>{% endif %}
   </div>
   <h3>Os mais graves</h3>
   {% if top5 %}<ol>{% for a in top5 %}<li><b>{{ a.id }}</b> [{{ a.severidade }}] {{ a.titulo }} — {{ a.alvos | map(attribute='alvo') | join(', ') }}</li>{% endfor %}</ol>
@@ -47,6 +48,11 @@
   {% if anterior %}<p>Comparado com {{ anterior }}.</p>{% else %}<p>Primeira sprint: não há comparação.</p>{% endif %}
   <p><b>Corrigidos:</b> {% for a in corrigidos %}{{ a.id }} {% else %}nenhum{% endfor %} ·
      <b>Regressões:</b> {% for a in regressoes %}{{ a.id }} {% else %}nenhuma{% endfor %}</p>
+  {% if alvo_removido %}
+  <h3>Alvo removido (a branch foi apagada)</h3>
+  <p class="legenda">Achados que só existiam em branches apagadas do GitHub e que ninguém reverificou em outro alvo: saem das fichas e não voltam nas próximas sprints, a não ser que reapareçam.</p>
+  <ul>{% for a in alvo_removido %}<li><b>{{ a.id }}</b> {{ a.titulo }} — {{ a.alvos | map(attribute='alvo') | join(', ') }}</li>{% endfor %}</ul>
+  {% endif %}
 </section>
 
 <section>
