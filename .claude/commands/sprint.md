@@ -77,7 +77,7 @@ Quando a compilação terminar: `MA sprint suite` (em segundo plano). Ela só ro
 
 ## 7b. Resultados na bancada
 Pule se `bancada` já estiver concluído. Fica antes dos textos e do relatório para que uma falha aqui apareça no PDF.
-1. `MA noturno bancada` — monta os resultados de `bancada.json` da pasta da sprint (gravado pelas fases E2E e serviço) em lotes de até 50. Se vier `ok: false`, a limitação já foi registrada: faça só o item 4, com `{"enviados": 0, "total": 0}`.
+1. `MA noturno bancada` — monta os resultados de `bancada.json` da pasta da sprint (gravado pelas fases E2E e serviço) em lotes de até 50. Se vier `desativada: true`, o usuário desligou a página: faça só o item 4, com `{"enviados": 0, "total": 0, "desativada": true}` (sem limitação). Se vier `ok: false` por outro motivo, a limitação já foi registrada: faça só o item 4, com `{"enviados": 0, "total": 0}`.
 2. Para cada lote: **uma** chamada `ArtifactData` com `action: "batch"`, `url` = o `url` impresso e `writes` = o lote exatamente como veio (cada entrada é `{op: "set", collection: "resultados", doc_id: "<código>__windows__agente", data: {teste, plataforma: "windows", quem: "agente", estado, nota, em}}`). Não leia a página nem mude nada fora de `resultados/<código>__windows__agente`.
 3. Se alguma chamada falhar (ferramenta indisponível, permissão negada, rede, página fora do ar): `MA noturno limitacao --origem bancada "resultados da bancada não enviados (<enviados> de <total>): <erro>"` e siga — os resultados continuam em `bancada.json` e no PDF.
 4. `MA sprint marcar bancada --detalhe '{"enviados": <n>, "total": <total>}'`.

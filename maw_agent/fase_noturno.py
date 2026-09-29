@@ -333,6 +333,16 @@ def acrescentar_limitacao(pasta: Path, texto: str, origem: str = "noturno") -> N
         sandbox.escrever_json(p, atuais + [texto])
 
 
+def bancada_desativada() -> bool:
+    """`desativada: true` em `privado/bancada/config.yaml`: o usuário escolheu não usar a página da bancada —
+    os resultados ficam só em `bancada.json` e no PDF, sem envio e sem limitação."""
+    try:
+        d = yaml.safe_load(Path(CONFIG_BANCADA).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    return bool(isinstance(d, dict) and d.get("desativada"))
+
+
 def url_bancada() -> str | None:
     """A página da bancada: `MAW_AGENTE_BANCADA_URL`, senão `url` de `privado/bancada/config.yaml`."""
     if os.environ.get("MAW_AGENTE_BANCADA_URL"):
@@ -410,6 +420,10 @@ def _bancada(args) -> int:
     pasta = _pasta_da_sprint(args)
     if pasta is None:
         return _saida({"ok": False, "erro": "nenhuma sprint em andamento: use --pasta"}, False)
+    if bancada_desativada():
+        return _saida({"ok": False, "desativada": True,
+                       "motivo": "envio à página da bancada desativado: os resultados ficam em bancada.json e no PDF"},
+                      False)
     try:
         dados = bancada.carregar(pasta)
         motivo = None if dados else ("a sprint não gerou bancada.json (a fase E2E não rodou ou não produziu "
@@ -1293,7 +1307,7 @@ class _Noite:
                 motivo = "o `claude -p` terminou sem gerar o PDF"
             self.limitar(f"o julgamento da execução noturna não chegou ao relatório ({motivo}): o relatório saiu "
                          "pela rede de segurança do script, com o que já estava pronto")
-        if (e.pasta / "bancada.json").exists() and not e.feito("bancada"):
+        if (e.pasta / "bancada.json").exists() and not e.feito("bancada") and not bancada_desativada():
             self.limitar("resultados da bancada não enviados à página da bancada: ficaram em bancada.json e neste PDF")
         for fase in ("consolidar", "encerrar", "relatorio"):
             et = Etapa(fase, self.ma + ["sprint", fase], 0.5 * HORA)

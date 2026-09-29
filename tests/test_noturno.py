@@ -1006,3 +1006,21 @@ def test_plataformas_da_bancada_le_a_copia_local(tmp_path):
     (tmp_path / "y.json").write_text("{quebrado", encoding="utf-8")
     assert N.plataformas_da_bancada(tmp_path) == {"x": ["linux"]}
     assert N.plataformas_da_bancada(tmp_path / "nao-existe") == {}
+
+
+
+def test_bancada_desativada_nao_envia_nem_registra_limitacao(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("desativada: true", encoding="utf-8")
+    monkeypatch.setattr(N, "CONFIG_BANCADA", cfg)
+    pasta = tmp_path / "sprint-09"
+    pasta.mkdir()
+    (pasta / "bancada.json").write_text('{"abrir": {"estado": "passou", "nota": "ok", "alvo": "main"}}', encoding="utf-8")
+
+    class A:
+        pass
+    a = A(); a.pasta = str(pasta)
+    assert N._bancada(a) != 0
+    saida = json.loads(capsys.readouterr().out)
+    assert saida["desativada"] is True and "lotes" not in saida
+    assert not (pasta / "limitacoes-bancada.json").exists()
