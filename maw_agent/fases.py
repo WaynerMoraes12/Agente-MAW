@@ -1346,6 +1346,26 @@ def cmd_catalogo(args: argparse.Namespace) -> int:
     return _saida({"itens": len(itens), "principios": len(princ), "erros": erros}, not erros)
 
 
+def _alvos_removidos(e: estado.Estado, hist_antes: dict) -> tuple[set[str], list[str]]:
+    """Alvos dos achados em aberto do histórico que não estão nesta sprint e cuja branch sumiu do origin
+    do espelho (lido só aqui, sem escrever; o `preparar` buscou com --prune). Sem `alvos.json` ou sem
+    candidato, nada é lido. Espelho ilegível: nada é removido e o motivo vai para os erros do agente."""
+    if not (e.pasta / "alvos.json").exists():
+        return set(), []
+    atuais = {a["nome"] for a in _alvos(e)}
+    candidatos = {x["alvo"] for reg in hist_antes.get("itens", {}).values()
+                  if reg.get("estado") in _ESTADOS_ABERTOS
+                  for x in (reg.get("ultimo") or {}).get("alvos", [])} - atuais
+    if not candidatos:
+        return set(), []
+    try:
+        origin = alvos.branches_do_origin(config.ESPELHO)
+    except (RuntimeError, OSError) as ex:
+        return set(), [f"branches do origin ilegíveis no espelho ({ex}): nenhum achado marcado como alvo removido; "
+                       f"os de {', '.join(sorted(candidatos))} ficaram sem reverificação"]
+    return alvos.alvos_removidos(candidatos, atuais, origin), []
+
+
 def _consolidar(args) -> int:
     """Idempotente: consolida sempre a partir do histórico como estava antes desta sprint
     (historico-antes.json, gravado na primeira execução) e reconstrói erros_agente.json."""
@@ -1366,12 +1386,16 @@ def _consolidar(args) -> int:
                                            e.pasta)
     rever, conflitos_rever = juntar_reverificacoes(e.pasta, incluir_base=False,
                                                    extras=[("automatico", derivadas)])
+    removidos, erros_removidos = _alvos_removidos(e, hist_antes)
     sandbox.escrever_json(e.pasta / "reverificacoes.json", rever)
-    sandbox.escrever_json(e.pasta / "erros_agente.json", erros_leitura + invalidos + conflitos_rever)
+    sandbox.escrever_json(e.pasta / "erros_agente.json",
+                          erros_leitura + invalidos + conflitos_rever + erros_removidos)
     # a promoção/rebaixamento de confiança pelo veredito já aconteceu em ler_brutos (spec §11.3)
     derrubados = [{"titulo": a["titulo"], "justificativa": a["veredito"].get("justificativa", "")}
                   for a in brutos if (a.get("veredito") or {}).get("resultado") == "derrubado"]
-    lista, hist = achados.consolidar(brutos, hist_antes, f"{e.numero:02d}", rever)
+    principal = next(({"alvo": a["nome"], "commit": a["commit"]} for a in _alvos(e) if a["nome"] == "main"), None) \
+        if (e.pasta / "alvos.json").exists() else None
+    lista, hist = achados.consolidar(brutos, hist_antes, f"{e.numero:02d}", rever, removidos, principal)
     achados.marcar_introducao(lista)
     sandbox.escrever_json(e.pasta / "achados.json", lista)
     sandbox.escrever_json(e.pasta / "derrubados.json", derrubados)
@@ -1389,7 +1413,8 @@ def _consolidar(args) -> int:
                                                                "resultado": "falhou", "motivo": atual.get("motivo"),
                                                                "achados": ids, "fonte": "consolidacao"}
     detalhe = {"achados": len(lista), "derrubados": len(derrubados), "achados_invalidos": len(invalidos),
-               "sem_verificacao_adversarial": sem_verif, "reverificacoes_automaticas": len(derivadas)}
+               "sem_verificacao_adversarial": sem_verif, "reverificacoes_automaticas": len(derivadas),
+               "alvos_removidos": sorted(removidos)}
     e.concluir("consolidar", detalhe)
     return _saida(detalhe)
 

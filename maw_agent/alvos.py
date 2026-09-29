@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import subprocess
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -156,6 +157,41 @@ def descobrir_alvos(espelho: Path, locais: list[dict]) -> tuple[list[Alvo], list
             lista.append(Alvo(nome, branch, c["ref"], c["commit"], c["origem"], assin, vistos.get(assin)))
             vistos.setdefault(assin, nome)
     return lista, avisos
+
+
+def branches_de_refs(refs: Iterable[str]) -> list[str]:
+    """Nomes das branches do origin em linhas de `git for-each-ref` (`refs/remotes/origin/<b>` ou
+    `origin/<b>`), sem o `HEAD`."""
+    out = []
+    for ref in refs:
+        ref = ref.strip()
+        for prefixo in ("refs/remotes/origin/", "origin/"):
+            if ref.startswith(prefixo):
+                branch = ref[len(prefixo):]
+                if branch and branch != "HEAD":
+                    out.append(branch)
+                break
+    return out
+
+
+def branches_do_origin(espelho: Path) -> list[str]:
+    """As branches que o origin tem no espelho do agente (só leitura; o `preparar` busca com --prune)."""
+    return branches_de_refs(git(["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
+                                Path(espelho), leitura=True).splitlines())
+
+
+def alvos_removidos(nomes: Iterable[str], alvos_sprint: Iterable[str], branches_origin: Iterable[str]) -> set[str]:
+    """Dos `nomes` de alvo (ex.: os dos achados do histórico), os que não estão nesta sprint e cuja branch
+    não existe mais no origin. O nome de um alvo é o `slug` da branch — ou `<slug>-local-<pasta>` para
+    um clone local (ver `descobrir_alvos`). Uma branch que ainda existe (ex.: já mesclada no main, por
+    isso fora dos alvos) não conta como removida."""
+    atuais = set(alvos_sprint)
+    slugs = {slug(b) for b in branches_origin}
+
+    def tem_branch(nome: str) -> bool:
+        return nome in slugs or any(nome.startswith(f"{s}-local-") for s in slugs)
+
+    return {n for n in set(nomes) if n not in atuais and not tem_branch(n)}
 
 
 def criar_worktree(espelho: Path, alvo: Alvo, raiz: Path = config.ALVOS_DIR) -> Path:

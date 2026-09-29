@@ -238,6 +238,37 @@ def test_prova_vazia_nao_e_verificada():
     assert alvos.comparar_provas({}, {}) == ["nenhuma pasta da MAW encontrada para provar"]
 
 
+# ---------- alvos removidos: a branch sumiu do origin ----------
+
+def test_branches_de_refs_ignora_head_e_aceita_nome_curto():
+    refs = ["refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/feature/mesclada",
+            "origin/docs/y", "", "refs/remotes/outro/z"]
+    assert alvos.branches_de_refs(refs) == ["main", "feature/mesclada", "docs/y"]
+
+
+def test_alvos_removidos_com_refs_falsos():
+    """Só o main é alvo; `feature/mesclada` ainda existe no origin (já mesclada: fora dos alvos) e não é
+    removida; as outras sumiram. Clone local leva a branch no nome (`<slug>-local-<pasta>`)."""
+    origin = ["main", "feature/mesclada", "Docs/Com Espaco"]
+    nomes = ["main", "feature-mesclada", "feature-apagada", "chore-sumiu", "feature-mesclada-local-maw2",
+             "sumiu-local-maw3", "docs-com-espaco"]
+    assert alvos.alvos_removidos(nomes, ["main"], origin) == {"feature-apagada", "chore-sumiu", "sumiu-local-maw3"}
+    # alvo desta sprint nunca é removido, nem se a branch não estiver no origin (ex.: só num clone local)
+    assert alvos.alvos_removidos(["so-local"], ["so-local"], []) == set()
+
+
+def test_branches_do_origin_le_o_espelho_depois_do_prune(mundo):
+    esp = alvos.garantir_espelho(mundo["tmp"] / "espelho", str(mundo["bare"]))
+    assert "docs/y" in alvos.branches_do_origin(esp)
+    sh("branch", "-D", "docs/y", cwd=mundo["bare"])  # apagada no GitHub
+    alvos.garantir_espelho(esp, str(mundo["bare"]))  # o preparar da sprint busca com --prune
+    antes = sh("for-each-ref", cwd=esp)
+    branches = alvos.branches_do_origin(esp)
+    assert "docs/y" not in branches and {"main", "feature/x", "feature/mesclada"} <= set(branches)
+    assert "HEAD" not in branches
+    assert sh("for-each-ref", cwd=esp) == antes  # só leitura
+
+
 def test_script_python_da_raiz_conta_como_codigo(mundo):
     """Todo script .py da raiz (ex.: o serviço de IA) entra na assinatura da árvore, sem nome fixo."""
     sh("checkout", "-qb", "feature/servico", cwd=mundo["origem"]); commit(mundo["origem"], "servico_x.py", "p", "s")

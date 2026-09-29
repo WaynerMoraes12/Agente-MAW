@@ -779,3 +779,61 @@ def test_suite_incoerente_com_sondas_declara_que_nao_da_para_separar(sprint, mon
     fases._suite(Args())
     assert any("incoerente com as sondas" in l for l in _ler(e.pasta / "limitacoes-sondas.json"))
     assert _resultados(e)[("saude/suite-existente", "main")]["resultado"] == "falhou"
+
+
+# ---------- alvo removido: a branch do achado foi apagada do origin ----------
+
+def _no_historico(itens: dict[str, tuple[str, str, list[str]]]):
+    """imp → (id, estado, alvos) com achados de código (fonte de especialista) no histórico."""
+    hist = {"proximo": len(itens) + 1, "itens": {}}
+    for imp, (id_, est, nomes) in itens.items():
+        ultimo = dict(_achado_valido(), assinatura=f"Source/{imp}.cpp::f",
+                      alvos=[{"alvo": n, "commit": "c" * 40} for n in nomes])
+        hist["itens"][imp] = {"id": id_, "estado": est, "historico": ["00"], "ultimo": ultimo,
+                              "sprint_do_estado": "00"}
+    sandbox.escrever_json(config.HISTORICO, hist)
+
+
+def test_consolidar_marca_alvo_removido_pelas_branches_do_espelho(sprint, monkeypatch):
+    """O main é o único alvo com código próprio; `feature/mesclada` continua no origin (mesclada) e
+    `feature/apagada` sumiu. A reverificação vence sempre; sem ela, só todos os alvos removidos viram
+    alvo_removido."""
+    e = sprint["estado"]
+    _no_historico({"a": ("MAW-0001", "aberto", ["feature-apagada"]),
+                   "b": ("MAW-0002", "novo", ["feature-apagada"]),
+                   "c": ("MAW-0003", "aberto", ["feature-mesclada"]),
+                   "d": ("MAW-0004", "aberto", ["feature-apagada", "main"])})
+    sandbox.escrever_json(e.pasta / "reverificacoes-testador-motor.json", {"MAW-0002": "persiste"})
+    lidos = []
+    monkeypatch.setattr(fases.alvos, "branches_do_origin",
+                        lambda esp: lidos.append(esp) or ["main", "docs/z", "feature/mesclada"])
+    fases._consolidar(None)
+    por_id = {a["id"]: a for a in _ler(e.pasta / "achados.json")}
+    assert por_id["MAW-0001"]["estado"] == "alvo_removido"
+    assert por_id["MAW-0002"]["estado"] == "aberto"  # o especialista do main viu que continua lá
+    assert {"alvo": "main", "commit": COMMIT} in por_id["MAW-0002"]["alvos"]
+    assert por_id["MAW-0003"]["estado"] == "nao_verificavel"  # a branch ainda existe no origin
+    assert por_id["MAW-0004"]["estado"] == "nao_verificavel"  # o main continua entre os alvos
+    assert lidos == [config.ESPELHO]
+    assert estado.carregar(e.pasta).dados("consolidar")["alvos_removidos"] == ["feature-apagada"]
+    # alvo removido não marca a célula da matriz como falhou
+    assert not any("MAW-0001" in (r.get("achados") or []) for r in _resultados(e).values())
+
+
+def test_consolidar_sem_candidato_nao_le_o_espelho(sprint, monkeypatch):
+    _no_historico({"a": ("MAW-0001", "aberto", ["main"]), "b": ("MAW-0002", "corrigido", ["feature-apagada"])})
+    monkeypatch.setattr(fases.alvos, "branches_do_origin", lambda esp: pytest.fail("não precisava ler o espelho"))
+    fases._consolidar(None)
+
+
+def test_consolidar_com_espelho_ilegivel_nao_remove_nada_e_diz_por_que(sprint, monkeypatch):
+    e = sprint["estado"]
+    _no_historico({"a": ("MAW-0001", "aberto", ["feature-apagada"])})
+
+    def quebrado(esp):
+        raise RuntimeError("git for-each-ref falhou")
+    monkeypatch.setattr(fases.alvos, "branches_do_origin", quebrado)
+    fases._consolidar(None)
+    [a] = _ler(e.pasta / "achados.json")
+    assert a["estado"] == "nao_verificavel"
+    assert any("alvo removido" in m and "for-each-ref" in m for m in _ler(e.pasta / "erros_agente.json"))
