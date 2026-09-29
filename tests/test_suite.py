@@ -71,7 +71,7 @@ import sys
 
 def test_executar_passa_o_ambiente(tmp_path):
     env = {**os.environ, "VAR_DO_TESTE": "valor-do-teste"}
-    codigo, saida, _ = suite.executar(Path(sys.executable),
+    codigo, saida, _, _ = suite.executar(Path(sys.executable),
                                       "-cimport os; print(os.environ.get('VAR_DO_TESTE'))", tmp_path, 60, env=env)
     assert codigo == 0 and "valor-do-teste" in saida
 
@@ -111,3 +111,70 @@ def test_ambiente_com_ffmpeg_no_path(tmp_path):
     env = suite.ambiente_com_ffmpeg(base, bin_)
     assert env["PATH"].split(os.pathsep)[0] == str(bin_) and env["OUTRA"] == "1"
     assert base["PATH"] == r"C:\Windows"  # não altera o dicionário recebido
+
+
+# ---------- stdout (relatório) × stderr (progresso "rodando: <área> / <bloco>") ----------
+
+PROGRESSO = "rodando: Bloco A / faz x\r\nrodando: Bloco B / faz y\r\n"
+
+
+def test_relatorio_so_do_stdout_e_progresso_do_stderr_a_parte():
+    """O progresso vai para o stderr enquanto a suíte roda: nunca entra no detalhe das falhas."""
+    r = suite.interpretar_suite(FALHA, 1, 1.0, stderr=PROGRESSO)
+    assert not any("rodando" in d for d in r.detalhes + r.preambulo)
+    assert r.ultimo_bloco == "Bloco B / faz y"
+    assert r.stderr == PROGRESSO and r.bruto == FALHA
+    d = r.como_dict()
+    assert d["ultimo_bloco"] == "Bloco B / faz y" and d["stderr"] == PROGRESSO
+
+
+def test_processo_que_morre_no_meio_diz_o_ultimo_bloco_e_nao_que_nao_rodou():
+    """O relatório só sai no fim: morto no meio, o stdout vem sem cabeçalho, mas os testes rodaram."""
+    r = suite.interpretar_suite("", -1073741571, 1.0, stderr=PROGRESSO)
+    assert not r.passou and r.ultimo_bloco == "Bloco B / faz y"
+    assert r.incoerencias == ["totais ausentes: a execução pode ter morrido antes do fim"]
+
+
+def test_sem_relatorio_e_sem_progresso_o_executavel_nao_rodou_os_testes():
+    r = suite.interpretar_suite("", 0, 1.0, stderr="")
+    assert r.ultimo_bloco is None
+    assert any("cabeçalho da suíte ausente" in i for i in r.incoerencias)
+
+
+def test_executar_devolve_stdout_e_stderr_separados_e_redigidos(tmp_path):
+    chave = "AIza" + "x" * 35
+    codigo_py = (f"import sys; print('relatorio {chave}'); "
+                 f"print('rodando: A / b {chave}', file=sys.stderr)")
+    codigo, saida, erro, _ = suite.executar(Path(sys.executable), "-c" + codigo_py, tmp_path, 60)
+    assert codigo == 0
+    assert "relatorio" in saida and "rodando" not in saida and chave not in saida
+    assert "rodando: A / b" in erro and "relatorio" not in erro and chave not in erro
+    assert "[REDACTED]" in saida and "[REDACTED]" in erro
+
+
+def test_executar_no_tempo_esgotado_guarda_o_parcial_de_cada_saida(tmp_path, monkeypatch):
+    chave = "AIza" + "y" * 35
+
+    def run_falso(args, **kw):
+        raise suite.subprocess.TimeoutExpired(args, 5, output=f"parcial {chave}".encode(),
+                                              stderr=b"rodando: A / preso")
+    monkeypatch.setattr(suite.subprocess, "run", run_falso)
+    codigo, saida, erro, _ = suite.executar(Path("x.exe"), "--run-tests", tmp_path, 5)
+    assert codigo is None and saida == "parcial [REDACTED]"
+    assert erro.startswith("rodando: A / preso") and "TIMEOUT depois de 5s" in erro
+
+
+def test_rodar_suite_interpreta_so_o_stdout(tmp_path, monkeypatch):
+    monkeypatch.setattr(suite, "executar", lambda *a, **k: (1, FALHA, PROGRESSO, 2.0))
+    r = suite.rodar_suite(Path("x.exe"), tmp_path)
+    assert r.total_falhas == 1 and r.ultimo_bloco == "Bloco B / faz y"
+    assert not any("rodando" in d for d in r.detalhes)
+
+
+def test_rodar_benchmark_le_a_tabela_do_stdout_e_guarda_o_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(suite, "executar", lambda *a, **k: (0, "Plugin do master descarregado\n" + BENCH,
+                                                            "rodando: algo\n", 3.0))
+    b = suite.rodar_benchmark(Path("x.exe"), tmp_path)
+    assert [l["trilhas"] for l in b["linhas"]] == [1, 32] and b["exit_code"] == 0
+    assert b["cabecalho"] == ["Plugin do master descarregado"]
+    assert b["stderr"] == "rodando: algo\n" and "rodando" not in b["bruto"]

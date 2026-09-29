@@ -102,6 +102,13 @@ def _detalhes_por_bloco(detalhes: list[str]) -> dict[tuple[str, str], list[str]]
     return out
 
 
+def _codigo_de_saida(codigo: int | None) -> str:
+    """O código como o Windows o mostra quando é um NTSTATUS (ex.: -1073741571 (0xC00000FD), estouro da pilha)."""
+    if codigo is None:
+        return "nenhum (tempo esgotado)"
+    return f"{codigo} (0x{codigo & 0xFFFFFFFF:08X})" if codigo < 0 or codigo > 0x7FFFFFFF else str(codigo)
+
+
 def achados_da_suite(alvo: dict, r: dict) -> list[dict]:
     evidencia_suite = {"arquivo": f"suites/{alvo['nome']}.json", "legenda": "relatório completo da suíte",
                        "embutir": False}
@@ -119,10 +126,18 @@ def achados_da_suite(alvo: dict, r: dict) -> list[dict]:
                         "sugestao": "corrigir o código (não o teste) até o bloco passar",
                         "criterio_aceite": f"o bloco '{b['nome']} → {b['sub']}' passa na suíte",
                         "assinatura": f"suite:{b['nome']}|{b['sub']}"})
+    ultimo = r.get("ultimo_bloco")
     for inc in r.get("incoerencias", []):
-        out.append({**base, "titulo": f"Relatório da suíte incoerente: {inc[:60]}", "tipo": "violacao",
+        titulo, obtido = f"Relatório da suíte incoerente: {inc[:60]}", inc
+        if ultimo and inc.startswith("totais ausentes"):
+            # a MAW escreve "rodando: <área> / <bloco>" no stderr: o processo caiu (ou travou) nesse bloco.
+            # A assinatura não leva o bloco: a mesma queda num bloco vizinho continua sendo o mesmo achado.
+            titulo += f" (último bloco: {ultimo[:50]})"
+            obtido = (f"{inc}. Último bloco que começou a rodar (stderr da suíte): '{ultimo}'. "
+                      f"Código de saída: {_codigo_de_saida(r.get('exit_code'))}.")
+        out.append({**base, "titulo": titulo, "tipo": "violacao",
                     "severidade": "alta", "item_catalogo": "saude/suite-existente", "principio": "P4",
-                    "esperado": "código de saída, linha RESULTADO e totais concordam", "obtido": inc,
+                    "esperado": "código de saída, linha RESULTADO e totais concordam", "obtido": obtido,
                     "sugestao": "fazer o relatório e o código de saída dizerem a mesma coisa",
                     "criterio_aceite": "a suíte roda e o relatório é coerente com o código de saída",
                     "assinatura": f"suite-incoerente:{inc}"})

@@ -666,3 +666,18 @@ def test_fonte_sonda_e_reservada_a_cli():
                                       MAPA_SONDAS)[0])
     erros = fases.conferir_referencias([a], None, {"main": "a" * 40})
     assert any("sonda" in e and "reservada" in e for e in erros)
+
+
+def test_achado_da_suite_que_morreu_no_meio_diz_o_bloco_que_rodava():
+    """A MAW escreve "rodando: <área> / <bloco>" no stderr: o achado do processo que caiu diz onde."""
+    inc = "totais ausentes: a execução pode ter morrido antes do fim"
+    r = {"blocos": [], "detalhes": [], "incoerencias": [inc], "assercoes": [], "exit_code": -1073741571,
+         "declarado": "AUSENTE", "ultimo_bloco": "Area X / bloco y"}
+    [a] = fases.achados_da_suite(ALVO, r)
+    assert achados.validar(a) == []
+    assert "Area X / bloco y" in a["obtido"] and "Area X / bloco y" in a["titulo"]
+    assert "0xC00000FD" in a["obtido"]  # o código de saída do Windows em hexadecimal
+    assert a["assinatura"] == f"suite-incoerente:{inc}"  # a impressão digital não depende do bloco
+    # sem o progresso (MAW antiga), o achado continua como era
+    [b] = fases.achados_da_suite(ALVO, {**r, "ultimo_bloco": None})
+    assert b["obtido"] == inc
