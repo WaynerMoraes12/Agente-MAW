@@ -963,7 +963,8 @@ def rodar(op: Opcoes, *, executar: Callable = executar_etapa, agora: Callable[[]
           manter_acordado: Callable[[bool], None] = _manter_acordado, verificar: Callable | None = None,
           status: Callable[[], dict] | None = None, confianca: Callable[[], bool | None] | None = None,
           sessao: Callable[[], bool | None] = sessao_bloqueada, volume: Callable[[], object] | None = None,
-          raiz: Path = config.RAIZ, ocioso: Callable[[], float | None] = segundos_ocioso) -> int:
+          raiz: Path = config.RAIZ, ocioso: Callable[[], float | None] = segundos_ocioso,
+          dormir: Callable[[float], None] = time.sleep) -> int:
     volume = volume or volume_padrao
     inicio = agora()
     reg = Registro(Path(logs) / f"{inicio:%Y-%m-%d}{'-ensaio' if op.ensaio else ''}.log")
@@ -1006,8 +1007,12 @@ def rodar(op: Opcoes, *, executar: Callable = executar_etapa, agora: Callable[[]
                       "falharia)")
         acoes, lims = planejar(op, disponiveis, inicio.date(), py, cl,
                                _tem_sondas() if tem_sondas is None else tem_sondas)
+        interativa = marca_interativa_valida(Path(logs))
+        if interativa:
+            reg.linha(f"marca {MARCA_INTERATIVA}: a sessão interativa julga esta noite; a rede de segurança "
+                      "espera ela gerar o PDF")
         if sem_confianca:
-            lims.insert(0, MSG_SEM_CONFIANCA)
+            lims.insert(0, MSG_SEM_CONFIANCA_INTERATIVO if interativa else MSG_SEM_CONFIANCA)
         if op.ensaio:
             return _ensaio(reg, executar, env, raiz, cl, disponiveis, acoes, lims,
                            verificar or _preflight_sem_sprint, status or status_tarefa, confianca, sessao)
@@ -1017,7 +1022,8 @@ def rodar(op: Opcoes, *, executar: Callable = executar_etapa, agora: Callable[[]
         try:
             noite = _Noite(op, reg, executar, env, raiz, py, lims, real, prazo,
                            prazo_final - timedelta(seconds=RESERVA_RELATORIO), agora, sessao, volume, ocioso,
-                           sem_confianca=sem_confianca)
+                           sem_confianca=sem_confianca,
+                           interativa=Path(logs) / MARCA_INTERATIVA if interativa else None, dormir=dormir)
             return noite.tudo(acoes)
         finally:
             manter_acordado(False)
@@ -1046,6 +1052,22 @@ def _preflight_sem_sprint():
 
 
 MSG_CONFIANCA = "aceite a confiança do workspace: rode `claude` uma vez nesta pasta"
+MSG_SEM_CONFIANCA_INTERATIVO = ("o workspace não é confiável para o `claude -p`: o julgamento desta noite foi "
+                                "conduzido pela sessão interativa do Claude Code, com os mesmos subagentes e o "
+                                "mesmo roteiro do /sprint")
+# a sessão interativa que vai julgar a noite deixa esta marca na pasta dos logs; a noite então espera ela
+# gerar o PDF em vez de consolidar sem os vereditos (a marca vale por MARCA_VALIDADE horas)
+MARCA_INTERATIVA = "julgamento-interativo.json"
+MARCA_VALIDADE = 20
+ESPERA_INTERATIVA = 60
+
+
+def marca_interativa_valida(logs: Path) -> bool:
+    try:
+        idade = time.time() - (Path(logs) / MARCA_INTERATIVA).stat().st_mtime
+    except OSError:
+        return False
+    return idade < MARCA_VALIDADE * 3600
 MSG_SEM_CONFIANCA = ("o workspace não é confiável para o Claude Code: o julgamento não rodou pelo claude -p "
                      "(rode `claude` uma vez na pasta e aceite; ou o julgamento é feito pela sessão interativa)")
 
@@ -1118,9 +1140,11 @@ class _Noite:
     """A sequência da noite, com o que ela lembra no caminho (sprint, limitações, julgamentos, prazos)."""
 
     def __init__(self, op, reg, executar, env, raiz, py, lims, real, prazo, corte, agora, sessao, volume,
-                 ocioso=segundos_ocioso, sem_confianca: bool = False):
+                 ocioso=segundos_ocioso, sem_confianca: bool = False, interativa: Path | None = None,
+                 dormir: Callable[[float], None] = time.sleep):
         self.op, self.reg, self._executar, self.env, self.raiz = op, reg, executar, env, raiz
         self.sem_confianca = sem_confianca  # sem julgamento por falta de confiança, não pela opção
+        self.interativa, self.dormir = interativa, dormir  # marca da sessão interativa que julga a noite
         self.ma = [py, "-m", "maw_agent"]
         self.real, self.prazo, self.corte, self.agora, self.sessao = real, prazo, corte, agora, sessao
         self.ocioso = ocioso
@@ -1211,6 +1235,9 @@ class _Noite:
                          f"{_duracao(RESERVA_RELATORIO)} guardada para o relatório): não rodaram "
                          + ", ".join(self.pulados_por_prazo))
         e = _estado(self.pasta)
+        if e is not None and not e.feito("relatorio") and self.interativa is not None:
+            self.esperar_sessao_interativa()
+            e = _estado(self.pasta)
         if e is not None and not e.feito("relatorio"):
             self.rede_de_seguranca(e)
         e = _estado(self.pasta)
@@ -1306,6 +1333,24 @@ class _Noite:
             self.reg.linha("restaurando o %APPDATA%\\MAW depois da interrupção", et.nome)
             rest = Etapa("restaurar", self.ma + ["sprint", "iniciar", "--retomar"], 0.5 * HORA)
             self.depois(rest, self.executar(rest))
+
+    def esperar_sessao_interativa(self) -> None:
+        """A sessão interativa está julgando: espera o PDF dela até o prazo final (a rede fica para depois)."""
+        self.reg.linha(f"esperando a sessão interativa gerar o PDF (até {self.corte:%d/%m %H:%M}; "
+                       f"apagar {MARCA_INTERATIVA} libera a rede de segurança)")
+        while True:
+            e = _estado(self.pasta)
+            if e is None or e.feito("relatorio"):
+                self.reg.linha("a sessão interativa gerou o PDF")
+                return
+            if not self.interativa.exists():
+                self.reg.linha(f"{MARCA_INTERATIVA} retirada: a rede de segurança segue")
+                return
+            if self.agora() >= self.corte:
+                self.limitar(f"a sessão interativa não terminou o julgamento até {self.corte:%H:%M}: o "
+                             "relatório saiu pela rede de segurança do script, com o que já estava pronto")
+                return
+            self.dormir(ESPERA_INTERATIVA)
 
     def rede_de_seguranca(self, e: estado.Estado) -> None:
         """O julgamento não chegou ao PDF: o script consolida, encerra e gera o relatório com o que há."""

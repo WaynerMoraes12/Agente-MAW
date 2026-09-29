@@ -4,7 +4,7 @@ import os
 import sys
 import time
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -624,12 +624,13 @@ class VolumeFalso:
 
 
 def _rodar(tmp_path, falso, op=None, agora=datetime(2026, 9, 28, 22, 0), sessao=lambda: False, volume=None,
-           ocioso=lambda: 3600.0, confianca=lambda: True):
+           ocioso=lambda: 3600.0, confianca=lambda: True, dormir=None):
     """`confianca` falsa por padrão: a noite dos testes nunca depende do ~/.claude.json de verdade."""
     relogio = agora if callable(agora) else (lambda: agora)
     return N.rodar(op or N.Opcoes(), executar=falso, agora=relogio, logs=tmp_path / "logs", python="py",
                    claude="claude.exe", tem_sondas=False, manter_acordado=lambda _: None, sessao=sessao,
-                   volume=volume or (lambda: None), ocioso=ocioso, confianca=confianca)
+                   volume=volume or (lambda: None), ocioso=ocioso, confianca=confianca,
+                   dormir=dormir or (lambda _s: None))
 
 
 def _lims(pasta, origem="noturno"):
@@ -1078,3 +1079,68 @@ def test_ensaio_sem_confianca_mostra_a_noite_sem_julgamento(tmp_path, capsys):
     saida = json.loads(capsys.readouterr().out)
     assert not any("julgamento" in p for p in saida["plano"])
     assert N.MSG_SEM_CONFIANCA in saida["limitacoes"]
+
+
+# ---------- julgamento pela sessão interativa: a rede de segurança espera ----------
+
+def _marca_interativa(tmp_path):
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    m = tmp_path / "logs" / N.MARCA_INTERATIVA
+    m.write_text('{"sprint": "sprint-02"}', encoding="utf-8")
+    return m
+
+
+def test_sessao_interativa_gera_o_pdf_e_a_rede_nao_roda(tmp_path):
+    """Sem confiança do workspace, a sessão interativa julga; a noite espera ela terminar em vez de
+    consolidar e gerar o PDF sem os vereditos."""
+    pasta = _sprint(tmp_path)
+    _marca_interativa(tmp_path)
+    esperas = []
+
+    def dormir(seg):
+        esperas.append(seg)
+        if len(esperas) == 3:
+            _marcar(pasta, "consolidar", "encerrar", "relatorio")(None)
+
+    falso = Falso(pasta)
+    assert _rodar(tmp_path, falso, confianca=lambda: False, dormir=dormir) == 0
+    assert not {"consolidar", "encerrar", "relatorio"} & set(falso.ordem)
+    assert len(esperas) == 3
+    lims = _lims(pasta)
+    assert N.MSG_SEM_CONFIANCA_INTERATIVO in lims and N.MSG_SEM_CONFIANCA not in lims
+    log = (tmp_path / "logs" / "2026-09-28.log").read_text(encoding="utf-8")
+    assert "esperando a sessão interativa" in log and "PDF gerado" in log
+
+
+def test_sessao_interativa_que_nao_termina_ate_o_prazo_cai_na_rede(tmp_path):
+    pasta = _sprint(tmp_path)
+    _marca_interativa(tmp_path)
+    agora = [datetime(2026, 9, 28, 22, 0)]
+    falso = Falso(pasta)
+
+    def dormir(seg):
+        agora[0] += timedelta(hours=2)
+
+    _rodar(tmp_path, falso, confianca=lambda: False, dormir=dormir, agora=lambda: agora[0])
+    assert falso.ordem[-3:] == ["consolidar", "encerrar", "relatorio"]
+    assert any("sessão interativa não terminou o julgamento" in l for l in _lims(pasta))
+
+
+def test_marca_interativa_retirada_libera_a_rede(tmp_path):
+    pasta = _sprint(tmp_path)
+    marca = _marca_interativa(tmp_path)
+    falso = Falso(pasta)
+    _rodar(tmp_path, falso, confianca=lambda: False, dormir=lambda s: marca.unlink())
+    assert falso.ordem[-3:] == ["consolidar", "encerrar", "relatorio"]
+
+
+def test_marca_interativa_velha_e_ignorada(tmp_path):
+    pasta = _sprint(tmp_path)
+    marca = _marca_interativa(tmp_path)
+    velho = time.time() - 30 * 3600
+    os.utime(marca, (velho, velho))
+    falso = Falso(pasta)
+    _rodar(tmp_path, falso, confianca=lambda: False,
+           dormir=lambda s: (_ for _ in ()).throw(AssertionError("não devia esperar")))
+    assert falso.ordem[-3:] == ["consolidar", "encerrar", "relatorio"]
+    assert N.MSG_SEM_CONFIANCA in _lims(pasta)
