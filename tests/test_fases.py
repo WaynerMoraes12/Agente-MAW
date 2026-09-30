@@ -681,3 +681,40 @@ def test_achado_da_suite_que_morreu_no_meio_diz_o_bloco_que_rodava():
     # sem o progresso (MAW antiga), o achado continua como era
     [b] = fases.achados_da_suite(ALVO, {**r, "ultimo_bloco": None})
     assert b["obtido"] == inc
+
+
+# ---------- reverificação dos achados da E2E e do serviço pelo cenário/checagem desta sprint ----------
+
+def test_reverificacao_automatica_da_e2e_pelo_cenario_desta_sprint(tmp_path):
+    """O critério de aceite de um achado da E2E é o próprio cenário passar no alvo."""
+    h = _hist(_reg("MAW-0001", "e2e", "e2e::servidor::localhost-ipv6-prazo-2s", item="ia/servidor"),
+              _reg("MAW-0002", "e2e", "e2e::mesa", item="mixer/geral"),
+              _reg("MAW-0003", "e2e", "e2e::gemini", item="ia/conselheiro"),
+              _reg("MAW-0004", "e2e", "e2e::sumiu", item="ia/conselheiro"),
+              _reg("MAW-0005", "e2e", "e2e::placa", alvos_=("docs-z",), item="interface/placa"))
+    _gravar(tmp_path, "estado.json", {"passos": {
+        "e2e:main:servidor": {"status": "concluido", "detalhe": {"estado": "passou"}},
+        "e2e:main:mesa": {"status": "concluido", "detalhe": {"estado": "problema"}},
+        "e2e:main:gemini": {"status": "concluido", "detalhe": {"estado": "pulei"}},
+        "e2e:main:placa": {"status": "concluido", "detalhe": {"estado": "passou"}}}})
+    r = fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path)
+    assert r == {"MAW-0001": "corrigido", "MAW-0002": "persiste", "MAW-0003": "nao_verificavel",
+                 "MAW-0004": "nao_verificavel", "MAW-0005": "corrigido"}  # docs-z usa a execução da origem
+
+
+def test_reverificacao_automatica_do_servico_pela_checagem_desta_sprint(tmp_path):
+    h = _hist(_reg("MAW-0001", "servico", "servico:separate-corpo-nao-json", item="servico/x"),
+              _reg("MAW-0002", "servico", "servico:separate-2stems", item="servico/x"),
+              _reg("MAW-0003", "servico", "servico:nao-rodou", item="servico/x"))
+    _gravar(tmp_path, "estado.json", {"passos": {"servico:main": {"status": "concluido", "detalhe": {
+        "checagens": [{"id": "separate-corpo-nao-json", "ok": True, "problemas": []},
+                      {"id": "separate-2stems", "ok": False, "problemas": ["x"]}]}}}})
+    r = fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path)
+    assert r == {"MAW-0001": "corrigido", "MAW-0002": "persiste", "MAW-0003": "nao_verificavel"}
+
+
+def test_reverificacao_automatica_da_e2e_sem_estado_nao_verifica(tmp_path):
+    h = _hist(_reg("MAW-0001", "e2e", "e2e::mesa", item="mixer/geral"),
+              _reg("MAW-0002", "servico", "servico:health", item="servico/x"))
+    assert fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path) == {
+        "MAW-0001": "nao_verificavel", "MAW-0002": "nao_verificavel"}

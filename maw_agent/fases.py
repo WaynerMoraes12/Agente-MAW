@@ -342,10 +342,28 @@ def juntar_reverificacoes(pasta: Path, incluir_base: bool = True,
 _ESTADOS_ABERTOS = ("novo", "aberto", "regressao", "nao_verificavel")
 
 
+def _veredito_da_fase(ultimo: dict, origem: str, pasta: Path) -> str:
+    """Achado da E2E ou do serviço: o critério de aceite é o cenário (`e2e::<id>[::...]`) ou a checagem
+    (`servico:<id>`) passar no alvo nesta sprint, pelo que a fase gravou no estado."""
+    assin = ultimo.get("assinatura", "")
+    passos = (_ler_json(pasta / "estado.json") or {}).get("passos") or {}
+    if ultimo.get("fonte") == "e2e":
+        cenario = assin[len("e2e::"):].split("::")[0] if assin.startswith("e2e::") else ""
+        estado_ = ((passos.get(f"e2e:{origem}:{cenario}") or {}).get("detalhe") or {}).get("estado")
+        return {"passou": "corrigido", "problema": "persiste"}.get(estado_, "nao_verificavel")
+    checagem = assin[len("servico:"):] if assin.startswith("servico:") else ""
+    for c in ((passos.get(f"servico:{origem}") or {}).get("detalhe") or {}).get("checagens") or []:
+        if c.get("id") == checagem:
+            return "corrigido" if c.get("ok") else "persiste"
+    return "nao_verificavel"
+
+
 def _veredito_automatico(ultimo: dict, origem: str, pasta: Path) -> str:
     """Reverifica um achado de build/suíte num alvo pelo seu critério de aceite: 'corrigido' só quando
     o critério passa nesta sprint; 'persiste' quando o mesmo erro reaparece; senão 'nao_verificavel'."""
     assin = ultimo.get("assinatura", "")
+    if ultimo.get("fonte") in ("e2e", "servico"):
+        return _veredito_da_fase(ultimo, origem, pasta)
     if ultimo.get("fonte") == "build":
         partes = assin.split(":")
         cfg = partes[1] if assin.startswith("build:") and len(partes) > 1 else \
@@ -381,8 +399,9 @@ def _veredito_automatico(ultimo: dict, origem: str, pasta: Path) -> str:
 
 
 def reverificacoes_automaticas(historico: dict, alvos_sprint: list[dict], pasta: Path) -> dict[str, str]:
-    """Reverificação dos achados abertos de fonte build/suíte/sonda: para cada alvo do achado que existe
-    nesta sprint (quem compartilha a árvore usa a execução da origem), olha o build/suíte desta sprint.
+    """Reverificação dos achados abertos de fonte build/suíte/sonda/e2e/serviço: para cada alvo do achado que
+    existe nesta sprint (quem compartilha a árvore usa a execução da origem), olha o build/suíte desta sprint,
+    ou o cenário/checagem que a E2E/o serviço rodou nela.
     Vários alvos: vale o mais conservador."""
     por_nome = {a["nome"]: a for a in alvos_sprint}
     out: dict[str, str] = {}
@@ -420,8 +439,8 @@ _RESULTADOS_VEREDITO = ("confirmado", "provavel", "derrubado")
 FONTES_MECANICAS = ("build", "suite", "e2e", "servico")
 # só as fases da própria CLI produzem estas fontes (a de sonda não é mecânica: passa pelo advogado)
 FONTES_DA_CLI = FONTES_MECANICAS + ("sonda",)
-# fontes que a consolidação reverifica sozinha pelo build/suíte desta sprint
-FONTES_REVERIFICADAS = ("build", "suite", "sonda")
+# fontes que a consolidação reverifica sozinha pelo build/suíte/E2E/serviço desta sprint
+FONTES_REVERIFICADAS = ("build", "suite", "sonda", "e2e", "servico")
 
 
 def ler_brutos(pasta: Path) -> tuple[list[tuple[str, dict]], set[int], list[str]]:
