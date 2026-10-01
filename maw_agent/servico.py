@@ -12,21 +12,32 @@ pelos requisitos do próprio alvo (`montar_ambiente`, com uv). `escolher_ambient
 qual Python usar: o próprio, quando ele foi montado pelos requisitos atuais do alvo; senão o
 ambiente comum (`work/py310`, com override) e uma limitação dizendo por quê — requisitos
 insatisfazíveis, ambiente ainda não montado, ou montagem que falhou.
+
+Token de quem chama: um alvo cujo script cita a marca de `token:` do YAML privado só atende quem
+manda, num cabeçalho, o token que o próprio serviço guarda num arquivo da pasta de dados do usuário.
+`ServicoApp(token=ConfigToken)` anota se o arquivo já existia, lê o token depois do `/health` (e, se
+ele ainda não existir, faz um pedido sem token para o serviço criá-lo) e `executar_checagem` o manda
+em toda checagem que não pedir outra coisa. O token é um segredo: nunca vai para log, evidência,
+achado ou resultado — `redigir` o troca por [REDACTED] junto com os padrões de `redacao`.
 """
 from __future__ import annotations
 import hashlib
+import hmac
+import http.client
 import io
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psutil
 import requests
@@ -51,6 +62,150 @@ _RX_SEGREDO_AMBIENTE = re.compile(r"(?i)(gemini|api[_-]?key|secret|token|passwor
 # não citam nada específico do alvo.
 _RX_PORTA_EM_USO = re.compile(r"(?i)address already in use|only one usage of each socket address|"
                               r"winerror 10048|eaddrinuse")
+
+
+# ---------- segredos conhecidos só em tempo de execução (o token lido do alvo) ----------
+
+_SEGREDOS: set[str] = set()
+
+
+def registrar_segredo(valor: str | None) -> None:
+    """Um valor secreto que só existe nesta execução (o token de um alvo): `redigir` passa a trocá-lo."""
+    if valor and len(valor) >= 8:
+        _SEGREDOS.add(valor)
+
+
+def redigir(texto: str) -> str:
+    """`redacao.redigir` mais os segredos registrados nesta execução — tudo o que a fase grava passa
+    por aqui."""
+    for s in sorted(_SEGREDOS, key=len, reverse=True):
+        texto = texto.replace(s, "[REDACTED]")
+    return redacao.redigir(texto)
+
+
+def _redigir_obj(obj, extra: str | None = None):
+    """Uma cópia de `obj` (JSON) com os segredos redigidos (e `extra`, o token em mãos)."""
+    texto = json.dumps(obj, ensure_ascii=False)
+    if extra and len(extra) >= 8:
+        texto = texto.replace(extra, "[REDACTED]")
+    return json.loads(redigir(texto))
+
+
+# ---------- token de quem chama ----------
+
+@dataclass(frozen=True)
+class ConfigToken:
+    """Do YAML privado (`token:`): como o serviço de um alvo reconhece quem o chama. `marca`: texto
+    cuja presença no script diz que o alvo usa o token; `arquivo`: onde ele fica, relativo à pasta de
+    dados do usuário (`pasta_de_dados_do_usuario`); `cabecalho`: onde ele vai em cada pedido;
+    `cabecalho_nonce`/`campo_prova`: o desafio do /health (prova = HMAC-SHA256(token, nonce), em
+    hex); `rota_gatilho`: pedido sem token que faz o serviço criar o arquivo, se ele ainda não existir."""
+    marca: str
+    cabecalho: str
+    arquivo: str
+    cabecalho_nonce: str | None = None
+    campo_prova: str = "prova"
+    rota_gatilho: str = "/"
+
+
+@dataclass(frozen=True)
+class TokenDoAlvo:
+    """O token lido do arquivo do alvo (None: não pôde ser lido). O valor nunca aparece no repr."""
+    config: ConfigToken
+    valor: str | None = field(default=None, repr=False)
+
+
+def _config_token(dados: dict) -> ConfigToken | None:
+    t = dados.get("token")
+    if not t:
+        return None
+    return ConfigToken(marca=str(t["marca_no_script"]), cabecalho=str(t["cabecalho"]), arquivo=str(t["arquivo"]),
+                       cabecalho_nonce=str(t["cabecalho_nonce"]) if t.get("cabecalho_nonce") else None,
+                       campo_prova=str(t.get("campo_prova") or "prova"), rota_gatilho=str(t.get("rota_gatilho") or "/"))
+
+
+def usa_token(script: Path, cfg: ConfigToken | None) -> bool:
+    """O script do serviço deste alvo cita a marca do token? (como `detectar_porta`, lendo o script)"""
+    if cfg is None or not Path(script).is_file():
+        return False
+    return cfg.marca in Path(script).read_text(encoding="utf-8", errors="replace")
+
+
+def pasta_de_dados_do_usuario() -> Path:
+    """A pasta de dados de aplicativo do usuário como o shell do Windows a dá (CSIDL_APPDATA, por
+    SHGetFolderPathW) — a que um serviço que a resolve assim usa, mesmo que a variável APPDATA do
+    ambiente do agente aponte para outro lugar. Fora do Windows, ou se o shell falhar: a variável
+    APPDATA (absoluta), ou ~/AppData/Roaming."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(1024)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x1A, None, 0, buf) == 0 and os.path.isabs(buf.value):
+                return Path(buf.value)
+        except Exception:
+            pass
+    valor = os.environ.get("APPDATA", "")
+    return Path(valor) if os.path.isabs(valor) else Path.home() / "AppData" / "Roaming"
+
+
+def caminho_do_token(cfg: ConfigToken) -> Path:
+    return pasta_de_dados_do_usuario() / cfg.arquivo
+
+
+def ler_token(caminho: Path) -> str | None:
+    """O conteúdo do arquivo do token, sem espaços nas pontas; None se não existir ou estiver vazio."""
+    try:
+        with open(caminho, "r", encoding="ascii", errors="replace") as f:
+            texto = f.read(256).strip()
+    except OSError:
+        return None
+    return texto or None
+
+
+def dentro_de(caminho: Path, pasta: Path) -> bool:
+    """`caminho` fica dentro de `pasta` (caixa, barras e links resolvidos)?"""
+    c = os.path.normcase(os.path.realpath(Path(caminho).absolute()))
+    p = os.path.normcase(os.path.realpath(Path(pasta).absolute())).rstrip("\\/")
+    return c.startswith(p + os.sep)
+
+
+def _token_errado(valor: str | None) -> str:
+    """Um token do mesmo formato (64 hex) que com certeza não é o do alvo."""
+    return "1" * 64 if valor == "0" * 64 else "0" * 64
+
+
+# ---------- variáveis de ambiente que o YAML privado põe no processo do serviço ----------
+
+@dataclass(frozen=True)
+class Variavel:
+    nome: str
+    valor: str
+    # só nos alvos cujo script usa o token (os outros rodam exatamente como antes)
+    requer_token: bool = False
+
+
+def _variaveis(dados: dict) -> list[Variavel]:
+    out = []
+    for v in dados.get("variaveis") or []:
+        var = Variavel(nome=str(v["nome"]), valor=str(v["valor"]), requer_token=bool(v.get("requer_token")))
+        if _RX_SEGREDO_AMBIENTE.search(var.nome) and redacao.segredos_em(var.valor):
+            raise ValueError(f"a variável {var.nome} do YAML tem um valor com cara de credencial de verdade: o "
+                             "processo do serviço só pode receber um valor forjado")
+        out.append(var)
+    return out
+
+
+def variaveis_do_processo(variaveis: list[Variavel], com_token: bool, contexto: dict[str, str]) -> dict[str, str]:
+    """{nome: valor} para o ambiente do serviço, com os tokens '{...}' de `contexto` resolvidos; as
+    `requer_token` só entram quando o alvo usa o token."""
+    return {v.nome: _formatar(v.valor, contexto) for v in variaveis if com_token or not v.requer_token}
+
+
+def _formatar(v: str, contexto: dict[str, str]) -> str:
+    try:
+        return v.format(**contexto)
+    except (KeyError, IndexError, ValueError):
+        return v
 
 
 def pasta_scripts(python: Path) -> Path:
@@ -181,6 +336,10 @@ def _esperar_saude(base_url: str, porta: int, timeout: float, processo: subproce
             erro_porta = _morte_por_porta_ocupada(porta, log)
             if erro_porta is not None:
                 raise erro_porta
+            if log is None:  # sem log para ler o motivo (saída num pipe): quem está na porta agora?
+                ocupado = processo_na_porta(porta)
+                if ocupado is not None:
+                    raise PortaOcupada(_mensagem_porta_ocupada(porta, ocupado))
             raise ServicoIndisponivel(f"o processo do serviço terminou sozinho (código {codigo}) "
                                       "antes de /health responder")
         try:
@@ -205,15 +364,22 @@ class ServicoApp:
     `PortaOcupada` é levantada sem iniciar nem mexer nesse outro processo (nunca é um defeito do
     alvo). O mesmo vale para uma morte muito rápida cujo log mostre um erro de porta em uso.
 
-    O ambiente do processo filho nunca carrega nenhuma variável cujo NOME pareça uma credencial
-    (`_ambiente_sem_segredos`) — o agente não precisa saber o nome de nenhuma chave para não
-    vazá-la.
+    O ambiente do processo filho nunca carrega nenhuma variável do agente cujo NOME pareça uma
+    credencial (`_ambiente_sem_segredos`) — o agente não precisa saber o nome de nenhuma chave para não
+    vazá-la. Só `ambiente_extra` (as variáveis do YAML privado, com valor forjado) entra por cima.
+
+    `token` (alvo cujo script usa o token de quem chama): antes de subir, anota se o arquivo do token
+    já existia (`token_existia`); depois do `/health`, lê o token (`token`, um `TokenDoAlvo`) — se o
+    arquivo ainda não existir, faz um pedido sem token para o serviço criá-lo. `saida_em_pipe`: a
+    saída do processo vai para um pipe que ninguém lê (como a de um serviço aberto por um programa
+    que não lê a saída dele), em vez do `log`.
     """
 
     def __init__(self, pasta_alvo: Path, *, script: str, python: Path | None = None,
                  ffmpeg: Path | None = None, porta: int | None = None,
                  timeout_saude: float = DEFAULT_TIMEOUT_SAUDE, ambiente_extra: dict[str, str] | None = None,
-                 log: Path | None = None):
+                 log: Path | None = None, token: ConfigToken | None = None, saida_em_pipe: bool = False,
+                 espera_token: float = 3.0):
         # os padrões (python/ffmpeg) são lidos do módulo em tempo de chamada, não como valor
         # default do parâmetro, para os testes trocarem PYTHON_SERVICO_PADRAO/FFMPEG_BIN_PADRAO
         # com monkeypatch.
@@ -228,10 +394,33 @@ class ServicoApp:
         self.log = Path(log) if log else None
         self.processo: subprocess.Popen | None = None
         self.saude: dict | None = None
+        self.config_token = token
+        self.saida_em_pipe = saida_em_pipe
+        self.espera_token = espera_token
+        self.token: TokenDoAlvo | None = None
+        self.token_caminho: Path | None = None
+        self.token_existia: bool | None = None
+        self.pasta_token_existia: bool | None = None
 
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.porta}"
+
+    def _obter_token(self) -> TokenDoAlvo:
+        cfg = self.config_token
+        valor = ler_token(self.token_caminho)
+        if not valor:
+            try:  # o serviço cria o token no primeiro pedido que precisar dele
+                requests.get(f"{self.base_url}{cfg.rota_gatilho}", timeout=5)
+            except requests.RequestException:
+                pass
+            fim = time.monotonic() + self.espera_token
+            valor = ler_token(self.token_caminho)
+            while not valor and time.monotonic() < fim:
+                time.sleep(0.1)
+                valor = ler_token(self.token_caminho)
+        registrar_segredo(valor)
+        return TokenDoAlvo(cfg, valor)
 
     def __enter__(self) -> "ServicoApp":
         if not self.python.exists():
@@ -248,8 +437,15 @@ class ServicoApp:
         # máquina pode estar em uso ao mesmo tempo. CREATE_NEW_PROCESS_GROUP: mata a árvore sem
         # levar o processo do agente junto num sinal de grupo.
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if self.config_token is not None:
+            self.token_caminho = caminho_do_token(self.config_token)
+            self.token_existia = self.token_caminho.exists()
+            self.pasta_token_existia = self.token_caminho.parent.exists()
         saida = subprocess.DEVNULL
-        if self.log is not None:
+        log = None if self.saida_em_pipe else self.log
+        if self.saida_em_pipe:
+            saida = subprocess.PIPE  # ninguém lê: é o que a checagem quer reproduzir
+        elif self.log is not None:
             sandbox.garantir_escrita(self.log)
             self.log.parent.mkdir(parents=True, exist_ok=True)
             saida = open(self.log, "wb")
@@ -259,17 +455,27 @@ class ServicoApp:
                 stdout=saida, stderr=subprocess.STDOUT, creationflags=flags,
             )
         finally:
-            if saida is not subprocess.DEVNULL:
+            if saida not in (subprocess.DEVNULL, subprocess.PIPE):
                 saida.close()
         try:
-            self.saude = _esperar_saude(self.base_url, self.porta, self.timeout_saude, self.processo, self.log)
-        except ServicoIndisponivel:
-            _matar_arvore(self.processo)
+            self.saude = _esperar_saude(self.base_url, self.porta, self.timeout_saude, self.processo, log)
+            if self.config_token is not None:
+                self.token = self._obter_token()
+        except BaseException:
+            self._encerrar()
             raise
         return self
 
-    def __exit__(self, *exc) -> None:
+    def _encerrar(self) -> None:
         _matar_arvore(self.processo)
+        if self.processo is not None and self.processo.stdout is not None:
+            try:
+                self.processo.stdout.close()
+            except OSError:
+                pass
+
+    def __exit__(self, *exc) -> None:
+        self._encerrar()
 
 
 # ---------- checagens data-driven (privado/cenarios/servico.yaml) ----------
@@ -300,6 +506,26 @@ class Checagem:
     # 'depende_do_ambiente': o resultado depende dos pacotes instalados no Python do serviço (não só
     # do código do alvo). Rodando fora do ambiente do próprio alvo, uma falha dela não é achado.
     depende_do_ambiente: bool = False
+    # --- quem chama (alvos cujo script usa o token; nos outros nada disto muda o pedido) ---
+    # 'certo' (padrão): manda o token do alvo; 'sem': não manda; 'errado': manda um token que não é o dele
+    token: str = "certo"
+    # 'requer_token': a checagem só existe para alvo cujo script usa o token; nos outros, `na`
+    requer_token: bool = False
+    # 'nonce': manda o desafio do token ('aleatorio' = 16 bytes novos em hex) e confere a prova da resposta
+    nonce: str | None = None
+    # --- o pedido ---
+    cabecalhos: dict = field(default_factory=dict)  # cabeçalhos a mais (aceitam '{porta}' etc.), ex.: Host
+    # pedido só com cabeçalhos — o corpo nunca é enviado: quem precisa recusar antes de ler o corpo
+    # responde; quem tenta lê-lo fica esperando e a checagem falha por tempo
+    content_length_declarado: int | None = None
+    transfer_encoding: str | None = None
+    repeticoes: int = 1  # o mesmo pedido N vezes; todas têm de bater
+    # sobe o serviço de novo, com a saída num pipe que ninguém lê, só para esta checagem
+    saida_em_pipe: bool = False
+    nao_contem: tuple[str, ...] = ()  # substrings que NÃO podem aparecer na resposta
+
+
+_TOKEN_OPCOES = ("certo", "sem", "errado")
 
 
 @dataclass
@@ -320,7 +546,8 @@ def carregar_checagens(caminho: Path) -> dict[str, list]:
     """Lê `privado/cenarios/servico.yaml`: `script` (nome do script do serviço, único lugar onde
     esse nome existe — nunca em código público), `checagens` (HTTP), `comandos` (subprocesso
     externo), `portas` (TCP) e `nao_testavel` (itens do catálogo sem checagem automática, cada um
-    com o motivo)."""
+    com o motivo); `token` (como o serviço reconhece quem chama, `ConfigToken`) e `variaveis`
+    (ambiente que o agente põe no processo do serviço), ambos opcionais."""
     import yaml
     dados = yaml.safe_load(Path(caminho).read_text(encoding="utf-8")) or {}
     checagens = []
@@ -329,9 +556,14 @@ def carregar_checagens(caminho: Path) -> dict[str, list]:
         c["status_esperado"] = _tupla(c.get("status_esperado", 200))
         c["chaves_esperadas"] = _tupla(c.get("chaves_esperadas"))
         c["contem"] = _tupla(c.get("contem"))
+        c["nao_contem"] = _tupla(c.get("nao_contem"))
         c["arquivos_esperados"] = _tupla(c.get("arquivos_esperados"))
         c["arquivos_proibidos"] = _tupla(c.get("arquivos_proibidos"))
         c["itens_catalogo"] = list(c.get("itens_catalogo") or [])
+        c["cabecalhos"] = {str(k): str(v) for k, v in (c.get("cabecalhos") or {}).items()}
+        c["token"] = str(c.get("token") or "certo")
+        if c["token"] not in _TOKEN_OPCOES:
+            raise ValueError(f"checagem {c.get('id')!r}: token {c['token']!r} desconhecido (use {', '.join(_TOKEN_OPCOES)})")
         checagens.append(Checagem(**c))
     comandos = []
     for c in dados.get("comandos", []):
@@ -347,13 +579,15 @@ def carregar_checagens(caminho: Path) -> dict[str, list]:
         portas.append(ChecagemPorta(**p))
     nao_testavel = [NaoTestavel(list(n["itens_catalogo"]), n["motivo"]) for n in dados.get("nao_testavel", [])]
     return {"script": dados.get("script"), "checagens": checagens, "comandos": comandos, "portas": portas,
-            "nao_testavel": nao_testavel, "ambiente": _config_ambiente(dados)}
+            "nao_testavel": nao_testavel, "ambiente": _config_ambiente(dados), "token": _config_token(dados),
+            "variaveis": _variaveis(dados)}
 
 
 def resolver_corpo(corpo: dict | None, contexto: dict[str, str]) -> dict | None:
     """Substitui os tokens '{nome}' do corpo (strings) pelos caminhos reais em `contexto`
     (ex.: audio_valido, audio_inexistente, saida) — as fixtures são geradas por execução, não
-    fixas no YAML, porque cada checagem usa a sua própria pasta de saída."""
+    fixas no YAML, porque cada checagem usa a sua própria pasta de saída. Um valor
+    `{repetir: texto, vezes: N}` vira o texto repetido N vezes (um campo grande sem escrevê-lo no YAML)."""
     if corpo is None:
         return None
     def resolver(v):
@@ -362,6 +596,8 @@ def resolver_corpo(corpo: dict | None, contexto: dict[str, str]) -> dict | None:
                 return v.format(**contexto)
             except (KeyError, IndexError):
                 return v
+        if isinstance(v, dict) and set(v) == {"repetir", "vezes"}:
+            return str(v["repetir"]) * int(v["vezes"])
         return v
     return {k: resolver(v) for k, v in corpo.items()}
 
@@ -384,6 +620,9 @@ def avaliar_resposta(chk: Checagem, status: int, corpo_json: dict | None, corpo_
     for s in chk.contem:
         if s not in corpo_texto:
             problemas.append(f"texto esperado ausente na resposta: {s!r}")
+    for s in chk.nao_contem:
+        if s in corpo_texto:
+            problemas.append(f"a resposta traz um texto que não deveria: {s!r}")
     arquivos_existem = arquivos_existem or {}
     for caminho in chk.arquivos_esperados:
         if arquivos_existem.get(caminho) is False:
@@ -394,32 +633,138 @@ def avaliar_resposta(chk: Checagem, status: int, corpo_json: dict | None, corpo_
     return (not problemas, problemas)
 
 
+def avaliar_prova(chk: Checagem, corpo_json, token: TokenDoAlvo | None, nonce: str | None) -> list[str]:
+    """Com nonce mandado, a resposta traz a prova = hex(HMAC-SHA256(token, nonce)) no campo do YAML,
+    conferida em tempo constante. Nenhum valor (token, nonce, prova) entra nos problemas."""
+    if chk.nonce is None:
+        return []
+    if token is None or not token.config.cabecalho_nonce:
+        return ["a checagem manda um nonce, mas o alvo não usa o token de quem chama"]
+    if not token.valor:
+        return ["o token do alvo não pôde ser lido: a prova não pode ser conferida"]
+    campo = token.config.campo_prova
+    recebida = corpo_json.get(campo) if isinstance(corpo_json, dict) else None
+    if not isinstance(recebida, str):
+        return [f"'{campo}' ausente na resposta, com o nonce mandado"]
+    esperada = hmac.new(token.valor.encode("ascii", "replace"), (nonce or "").encode("ascii", "replace"),
+                        hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(recebida.encode("utf-8", "replace"), esperada.encode("ascii")):
+        return [f"'{campo}' não confere com HMAC-SHA256(token, nonce)"]
+    return []
+
+
+def precisa_do_token(chk: Checagem) -> bool:
+    """A checagem só faz sentido com o token do alvo em mãos (manda o certo ou confere a prova)."""
+    return chk.token == "certo" or chk.nonce is not None
+
+
+def _nonce(chk: Checagem, contexto: dict[str, str]) -> str | None:
+    if chk.nonce is None:
+        return None
+    return secrets.token_hex(16) if chk.nonce == "aleatorio" else _formatar(chk.nonce, contexto)
+
+
+def cabecalhos_do_pedido(chk: Checagem, contexto: dict[str, str], token: TokenDoAlvo | None,
+                         nonce: str | None) -> dict[str, str]:
+    """Os cabeçalhos a mais do pedido: os da checagem e, num alvo com token (`token` não None), o
+    token certo (padrão), nenhum ('sem') ou um errado ('errado'), e o nonce."""
+    h = {k: _formatar(v, contexto) for k, v in (chk.cabecalhos or {}).items()}
+    if token is not None:
+        cab = token.config.cabecalho
+        if chk.token == "certo" and token.valor:
+            h.setdefault(cab, token.valor)
+        elif chk.token == "errado":
+            h[cab] = _token_errado(token.valor)
+        if nonce is not None and token.config.cabecalho_nonce:
+            h[token.config.cabecalho_nonce] = nonce
+    return h
+
+
+def _pedido_sem_corpo(base_url: str, metodo: str, rota: str, cabecalhos: dict[str, str],
+                      timeout: float) -> tuple[int, str]:
+    """Pedido só com a linha e os cabeçalhos (o Content-Length declarado nunca é cumprido), por
+    http.client: nem `requests` nem o urllib3 mandam um Content-Length ou Transfer-Encoding que não
+    batem com o corpo."""
+    u = urlsplit(base_url)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
+    try:
+        tem_host = any(k.lower() == "host" for k in cabecalhos)
+        conn.putrequest(metodo, rota, skip_host=tem_host, skip_accept_encoding=True)
+        for k, v in cabecalhos.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        r = conn.getresponse()
+        return r.status, r.read().decode("utf-8", errors="replace")
+    finally:
+        conn.close()
+
+
 def executar_checagem(base_url: str, chk: Checagem, contexto: dict[str, str],
-                      sessao: requests.Session | None = None) -> tuple[bool, list[str], dict]:
+                      sessao: requests.Session | None = None,
+                      token: TokenDoAlvo | None = None) -> tuple[bool, list[str], dict]:
     """Manda a requisição de verdade e avalia com `avaliar_resposta`. `contexto` resolve os
-    tokens do corpo (audio_valido, saida, ...). Devolve (ok, problemas, detalhe-para-evidência)."""
+    tokens do corpo (audio_valido, saida, ...) e dos cabeçalhos ({porta}). `token`: o do alvo, se o
+    script dele usa token (None = alvo sem token: o pedido sai como sempre saiu). Devolve (ok,
+    problemas, detalhe-para-evidência), já sem o token."""
     s = sessao or requests
-    corpo = resolver_corpo(chk.corpo, contexto)
+    nonce = _nonce(chk, contexto)
+    cabecalhos = cabecalhos_do_pedido(chk, contexto, token, nonce)
+    cru = chk.content_length_declarado is not None or chk.transfer_encoding is not None
     kwargs: dict = {"timeout": chk.timeout}
-    if chk.corpo_bruto is not None:
-        kwargs["data"] = resolver_corpo({"_": chk.corpo_bruto}, contexto)["_"].encode("utf-8")
+    if cru:
         if chk.tipo_conteudo:
-            kwargs["headers"] = {"Content-Type": chk.tipo_conteudo}
-    elif corpo is not None:
-        kwargs["json"] = corpo
-    try:
-        r = s.request(chk.metodo, f"{base_url}{chk.rota}", **kwargs)
-    except requests.RequestException as ex:
-        return False, [f"a requisição falhou: {ex}"], {"excecao": str(ex)}
-    try:
-        corpo_json = r.json()
-    except ValueError:
-        corpo_json = None
+            cabecalhos.setdefault("Content-Type", chk.tipo_conteudo)
+        if chk.transfer_encoding is not None:
+            cabecalhos["Transfer-Encoding"] = chk.transfer_encoding
+        if chk.content_length_declarado is not None:
+            cabecalhos["Content-Length"] = str(int(chk.content_length_declarado))
+    else:
+        corpo = resolver_corpo(chk.corpo, contexto)
+        if chk.corpo_bruto is not None:
+            kwargs["data"] = resolver_corpo({"_": chk.corpo_bruto}, contexto)["_"].encode("utf-8")
+            if chk.tipo_conteudo:
+                kwargs["headers"] = {"Content-Type": chk.tipo_conteudo}
+        elif corpo is not None:
+            kwargs["json"] = corpo
+        if cabecalhos:
+            kwargs["headers"] = {**kwargs.get("headers", {}), **cabecalhos}
+    segredo = token.valor if token is not None else None
+    vezes = max(1, int(chk.repeticoes or 1))
     caminhos = [resolver_corpo({"_": c}, contexto)["_"] for c in (*chk.arquivos_esperados, *chk.arquivos_proibidos)]
-    arquivos_existem = {c: Path(c).exists() for c in caminhos}
-    ok, problemas = avaliar_resposta(chk, r.status_code, corpo_json, r.text, arquivos_existem)
-    detalhe = {"status": r.status_code, "corpo": corpo_json if corpo_json is not None else r.text[:2000]}
-    return ok, problemas, detalhe
+    ok, problemas, detalhe = False, [], {}
+    for i in range(vezes):
+        no_pedido = f"no pedido {i + 1} de {vezes}: " if vezes > 1 else ""
+        try:
+            if cru:
+                status, texto = _pedido_sem_corpo(base_url, chk.metodo, chk.rota, cabecalhos, chk.timeout)
+            else:
+                r = s.request(chk.metodo, f"{base_url}{chk.rota}", **kwargs)
+                status, texto = r.status_code, r.text
+        except (requests.RequestException, OSError, http.client.HTTPException) as ex:
+            detalhe = {"excecao": str(ex)}
+            if vezes > 1:
+                detalhe["pedidos"] = i + 1
+            return False, _redigir_obj([f"{no_pedido}a requisição falhou: {ex}"], segredo), _redigir_obj(detalhe, segredo)
+        try:
+            corpo_json = json.loads(texto)
+        except ValueError:
+            corpo_json = None
+        arquivos_existem = {c: Path(c).exists() for c in caminhos}
+        ok, problemas = avaliar_resposta(chk, status, corpo_json, texto, arquivos_existem)
+        problemas = problemas + avaliar_prova(chk, corpo_json, token, nonce)
+        ok = not problemas
+        detalhe = {"status": status, "corpo": corpo_json if corpo_json is not None else texto[:2000]}
+        if vezes > 1:
+            detalhe["pedidos"] = i + 1
+        if not ok:
+            problemas = [f"{no_pedido}{p}" for p in problemas]
+            break
+        if i + 1 < vezes and chk.nonce == "aleatorio":
+            nonce = _nonce(chk, contexto)
+            cabecalhos = cabecalhos_do_pedido(chk, contexto, token, nonce)
+            if not cru:
+                kwargs["headers"] = {**kwargs.get("headers", {}), **cabecalhos}
+    return ok, _redigir_obj(problemas, segredo), _redigir_obj(detalhe, segredo)
 
 
 # ---------- checagens de comando e de porta (fora do HTTP) ----------
