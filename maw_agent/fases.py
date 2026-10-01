@@ -354,7 +354,7 @@ def _veredito_da_fase(ultimo: dict, origem: str, pasta: Path) -> str:
     checagem = assin[len("servico:"):] if assin.startswith("servico:") else ""
     for c in ((passos.get(f"servico:{origem}") or {}).get("detalhe") or {}).get("checagens") or []:
         if c.get("id") == checagem:
-            return "corrigido" if c.get("ok") else "persiste"
+            return {True: "corrigido", False: "persiste"}.get(c.get("ok"), "nao_verificavel")
     return "nao_verificavel"
 
 

@@ -718,3 +718,11 @@ def test_reverificacao_automatica_da_e2e_sem_estado_nao_verifica(tmp_path):
               _reg("MAW-0002", "servico", "servico:health", item="servico/x"))
     assert fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path) == {
         "MAW-0001": "nao_verificavel", "MAW-0002": "nao_verificavel"}
+
+
+def test_reverificacao_automatica_do_servico_checagem_sem_resultado_nao_verifica(tmp_path):
+    """`ok: None` (checagem pulada ou `na` neste alvo) não é nem corrigido nem persiste."""
+    h = _hist(_reg("MAW-0001", "servico", "servico:sem-resultado", item="servico/x"))
+    _gravar(tmp_path, "estado.json", {"passos": {"servico:main": {"status": "concluido", "detalhe": {
+        "checagens": [{"id": "sem-resultado", "ok": None, "problemas": []}]}}}})
+    assert fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path) == {"MAW-0001": "nao_verificavel"}
