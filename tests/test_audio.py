@@ -467,6 +467,347 @@ def test_gravador_captura_enquanto_o_bloco_with_roda(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Continuidade da captura: blocos perdidos (relógio x quadros, transbordos)
+# ---------------------------------------------------------------------------
+
+SR48 = 48000
+
+
+def _leituras(duracao_s: float, sr: int = SR48, bloco: int = 1024, perdas: dict[float, int] | None = None,
+              atrasos: dict[float, float] | None = None, deriva: float = 0.0, jitter_s: float = 0.0,
+              semente: int = 0) -> list[tuple[float, int]]:
+    """Leituras sintéticas (instante em que o read() voltou, quadros acumulados) de uma captura em tempo real.
+
+    `perdas`: {instante_s: quadros} que a captura jogou fora (somem do acumulado, o relógio segue);
+    `atrasos`: {instante_s: segundos} em que a thread de leitura ficou presa sem perder nada (as leituras
+    seguintes voltam juntas, de uma vez); `deriva`: relógio da placa mais lento (+) ou rápido (-) que o do PC,
+    relativo; `jitter_s`: atraso aleatório (só para cima) em cada volta do read()."""
+    rng = np.random.default_rng(semente)
+    perdas = dict(perdas or {})
+    atrasos = dict(atrasos or {})
+    out = []
+    t_audio = 0.0     # instante (relógio do PC) em que o último quadro entregue chegou à placa
+    acumulado = 0
+    livre = 0.0       # a thread de leitura só volta a ler a partir daqui
+    while t_audio < duracao_s:
+        t_audio += bloco / sr * (1 + deriva)
+        for t_p, q in list(perdas.items()):
+            if t_audio >= t_p:
+                t_audio += q / sr * (1 + deriva)  # quadros que passaram pela placa e não chegaram ao agente
+                del perdas[t_p]
+        acumulado += bloco
+        for t_a, d in list(atrasos.items()):
+            if t_audio >= t_a:
+                livre = t_audio + d
+                del atrasos[t_a]
+        volta = max(t_audio, livre) + (float(rng.uniform(0, jitter_s)) if jitter_s else 0.0)
+        out.append((volta, acumulado))
+    return out
+
+
+def test_continuidade_captura_continua_nao_perde():
+    c = audio.continuidade(_leituras(10.0, jitter_s=0.002), SR48)
+    assert c["medida"] is True
+    assert c["perdeu"] is False
+    assert c["quadros_perdidos"] == 0
+    assert c["motivo"] is None
+
+
+def test_continuidade_um_bloco_de_512_perdido():
+    c = audio.continuidade(_leituras(10.0, perdas={5.0: 512}, jitter_s=0.002), SR48)
+    assert c["perdeu"] is True
+    assert c["quadros_perdidos"] == pytest.approx(512, abs=64)
+    assert "512" in c["motivo"] or "quadros" in c["motivo"]
+    assert c["perdas"] and c["perdas"][0]["em_s"] == pytest.approx(5.0, abs=0.5)
+
+
+def test_continuidade_varias_perdas_somam():
+    # perdas esparsas de 1, 11, 7, 1 e 2 blocos de 512 ao longo da captura
+    perdas = {1.5: 512, 3.0: 11 * 512, 3.6: 7 * 512, 5.5: 512, 8.5: 2 * 512}
+    c = audio.continuidade(_leituras(11.0, perdas=perdas, jitter_s=0.002), SR48)
+    assert c["perdeu"] is True
+    assert c["quadros_perdidos"] == pytest.approx(22 * 512, abs=5 * 64)
+
+
+def test_continuidade_thread_presa_sem_perder_nao_e_perda():
+    # a thread ficou 80 ms sem ler e depois leu tudo de uma vez: atraso, não perda
+    c = audio.continuidade(_leituras(10.0, atrasos={4.0: 0.08, 7.0: 0.05}, jitter_s=0.002), SR48)
+    assert c["perdeu"] is False
+    assert c["quadros_perdidos"] == 0
+
+
+@pytest.mark.parametrize("deriva", [1e-3, -1e-3])
+def test_continuidade_deriva_do_relogio_da_placa_nao_e_perda(deriva):
+    c = audio.continuidade(_leituras(15.0, deriva=deriva, jitter_s=0.002), SR48)
+    assert c["perdeu"] is False
+
+
+def test_continuidade_perda_no_inicio_antes_de_assentar_nao_conta():
+    c = audio.continuidade(_leituras(10.0, perdas={0.05: 2048}), SR48)
+    assert c["perdeu"] is False
+
+
+def test_continuidade_transbordo_avisado_depois_de_assentar_e_perda():
+    leit = _leituras(6.0)
+    c = audio.continuidade(leit, SR48, transbordos=[(leit[0][0] + 3.0, 3 * 48000)])
+    assert c["perdeu"] is True
+    assert c["transbordos"] == 1
+    assert "transbordo" in c["motivo"]
+
+
+def test_continuidade_transbordo_so_no_inicio_fica_registrado_mas_nao_e_perda():
+    leit = _leituras(6.0)
+    c = audio.continuidade(leit, SR48, transbordos=[(leit[0][0] + 0.01, 0)])
+    assert c["perdeu"] is False
+    assert c["transbordos"] == 1
+
+
+def test_continuidade_captura_curta_demais_nao_e_medida():
+    c = audio.continuidade(_leituras(0.05), SR48)
+    assert c["medida"] is False
+    assert c["perdeu"] is False
+    assert audio.continuidade([], SR48)["medida"] is False
+
+
+def test_continuidade_conta_quadros_esperados_e_recebidos():
+    c = audio.continuidade(_leituras(10.0, perdas={5.0: 4096}), SR48)
+    assert c["quadros_esperados"] - c["quadros_recebidos"] == pytest.approx(4096, abs=1100)
+
+
+class _Relogio:
+    def __init__(self) -> None:
+        self.t = 100.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class _StreamNoRelogio:
+    """Stream mono que anda um relógio falso a cada leitura, como a placa em tempo real: `pular` = {nº da
+    leitura: quadros que a captura perdeu antes dela} (o relógio anda, os quadros não chegam);
+    `transbordo_em` = leituras em que o PortAudio avisa transbordo (OSError -9981) quando pedido."""
+
+    def __init__(self, relogio: _Relogio, sr: int, pular: dict[int, int] | None = None,
+                 transbordo_em: set[int] | None = None, transborda_desde: int | None = None) -> None:
+        self.relogio, self.sr = relogio, sr
+        self.pular = pular or {}
+        self.transbordo_em = transbordo_em or set()
+        self.desde = transborda_desde
+        self.n = 0
+        self.pedidos_com_excecao: list[bool] = []
+
+    def read(self, n_quadros: int, exception_on_overflow: bool = False) -> bytes:
+        self.n += 1
+        self.pedidos_com_excecao.append(exception_on_overflow)
+        self.relogio.t += (n_quadros + self.pular.get(self.n, 0)) / self.sr
+        if exception_on_overflow and (self.n in self.transbordo_em or (self.desde is not None and self.n >= self.desde)):
+            raise OSError(-9981, "Input overflowed")
+        return (np.full(n_quadros, 0.1, dtype=np.float32)).tobytes()
+
+    def stop_stream(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _pyaudio_falso_com_stream(stream, sr: int = SR48, canais: int = 1):
+    class _PyAudioFalso:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def get_default_wasapi_loopback(self) -> dict:
+            return {"defaultSampleRate": float(sr), "maxInputChannels": canais, "index": 0,
+                    "name": "Falso [Loopback]"}
+
+        def open(self, **kwargs):
+            return stream
+
+        def terminate(self) -> None:
+            pass
+
+    return _PyAudioFalso
+
+
+def _gravar_com(monkeypatch, stream, relogio, segundos: float = 3.0) -> "audio.Gravador":
+    monkeypatch.setattr(audio, "_relogio", relogio)
+    monkeypatch.setattr(audio.pyaudio, "PyAudio", _pyaudio_falso_com_stream(stream))
+    with audio.Gravador(segundos_max=segundos) as g:
+        while g._thread.is_alive():  # o stream falso é instantâneo: a thread para sozinha em segundos_max
+            time.sleep(0.01)
+    return g
+
+
+def test_gravador_captura_continua_nao_perde_entrada(monkeypatch):
+    relogio = _Relogio()
+    g = _gravar_com(monkeypatch, _StreamNoRelogio(relogio, SR48), relogio)
+    assert g.continuidade["medida"] is True
+    assert g.perdeu_entrada is False
+    assert g.motivo_perda is None
+    assert g.sinal[0].size >= 2 * SR48
+
+
+def test_gravador_detecta_blocos_perdidos_pelo_relogio(monkeypatch):
+    relogio = _Relogio()
+    g = _gravar_com(monkeypatch, _StreamNoRelogio(relogio, SR48, pular={70: 11 * 512, 100: 7 * 512}), relogio)
+    assert g.perdeu_entrada is True
+    assert g.continuidade["quadros_perdidos"] == pytest.approx(18 * 512, abs=128)
+    assert "loopback" in g.motivo_perda
+
+
+def test_gravador_transbordo_avisado_nao_derruba_a_captura(monkeypatch):
+    relogio = _Relogio()
+    stream = _StreamNoRelogio(relogio, SR48, transbordo_em={60})
+    g = _gravar_com(monkeypatch, stream, relogio)  # não levanta LoopbackIndisponivel
+    assert stream.pedidos_com_excecao[0] is True  # o transbordo é pedido ao PortAudio, não ignorado
+    assert g.continuidade["transbordos"] == 1
+    assert g.perdeu_entrada is True
+    assert g.sinal[0].size > 0
+
+
+def test_gravador_transbordo_em_toda_leitura_desiste_do_aviso_e_continua_gravando(monkeypatch):
+    relogio = _Relogio()
+    stream = _StreamNoRelogio(relogio, SR48, transborda_desde=40)  # do meio em diante, toda leitura avisa
+    g = _gravar_com(monkeypatch, stream, relogio)
+    assert False in stream.pedidos_com_excecao  # passou a ler sem o aviso para não ficar sem áudio nenhum
+    assert g.sinal[0].size > SR48
+    assert g.perdeu_entrada is True
+    assert "transbordo" in g.motivo_perda and "sem o aviso" in g.motivo_perda
+    assert g.continuidade["sem_aviso_de_transbordo"] is True
+
+
+def test_gravador_transbordo_em_toda_leitura_desde_o_inicio_nao_fica_sem_audio(monkeypatch):
+    relogio = _Relogio()
+    stream = _StreamNoRelogio(relogio, SR48, transborda_desde=1)
+    g = _gravar_com(monkeypatch, stream, relogio)
+    assert g.sinal[0].size > SR48  # os avisos do começo (antes de assentar) não deixam a captura vazia
+
+
+def test_captura_loopback_preenche_a_continuidade(monkeypatch):
+    relogio = _Relogio()
+    monkeypatch.setattr(audio, "_relogio", relogio)
+    monkeypatch.setattr(audio.pyaudio, "PyAudio",
+                        _pyaudio_falso_com_stream(_StreamNoRelogio(relogio, SR48, pular={40: 4096})))
+    cont: dict = {}
+    sinal, sr = audio.captura_loopback(2.0, continuidade=cont)
+    assert sr == SR48 and sinal.size > 0
+    assert cont["perdeu"] is True
+
+
+# ---------- medidas de apoio para cenários que medem tempo na captura ----------
+
+def test_deficits_em_blocos_acha_multiplos_inteiros_de_bloco():
+    sr = SR48
+    esperados = [0.5] * 8
+    intervalos = [0.5, 0.5, 0.5 - 512 / sr, 0.5, 0.5 - 11 * 512 / sr, 0.5 - 7 * 512 / sr, 0.5, 0.5]
+    assert audio.deficits_em_blocos(intervalos, esperados, sr, bloco=512) == [0, 0, 1, 0, 11, 7, 0, 0]
+
+
+def test_deficits_em_blocos_ignora_desvio_que_nao_e_bloco_inteiro():
+    sr = SR48
+    assert audio.deficits_em_blocos([0.5 - 0.004, 0.5 + 512 / sr, 0.5 - 300 / sr], [0.5] * 3, sr) == [0, 0, 0]
+
+
+def test_deficits_em_blocos_desvio_sistematico_nao_e_perda_de_captura():
+    # o andamento errado em todos os intervalos (ex.: 44,1 kHz, 1,0 s esperado e 0,5 s medido dá ~43 blocos)
+    sr = 44100
+    assert audio.deficits_em_blocos([0.5] * 6, [1.0] * 6, sr) == [0] * 6
+    # a maioria dos intervalos com o mesmo déficit é desvio da fonte, não perda esparsa da captura
+    iv = [0.5 - 2 * 512 / sr] * 5 + [0.5]
+    assert audio.deficits_em_blocos(iv, [0.5] * 6, sr) == [0] * 6
+
+
+def _bipes(tempos: list[float], freqs: list[float], sr: int = SR48, duracao_s: float | None = None) -> np.ndarray:
+    n = int(((duracao_s or (max(tempos) + 0.5))) * sr)
+    x = np.zeros(n)
+    t = np.arange(int(0.02 * sr)) / sr
+    for t0, f in zip(tempos, freqs):
+        a = int(t0 * sr)
+        onda = 0.6 * np.sin(2 * np.pi * f * t) * np.exp(-40 * t)
+        x[a:a + onda.size] += onda[: max(0, n - a)]
+    return x
+
+
+def test_acentos_separa_bipe_agudo_do_grave():
+    tempos = [0.5 + 0.5 * i for i in range(8)]
+    freqs = [1500, 1000, 1000, 1000, 1500, 1000, 1000, 1000]
+    x = _bipes(tempos, freqs)
+    ts = audio.cliques(x, SR48, limiar_relativo=0.25, distancia_min_s=0.2)
+    tipos, medidas = audio.acentos(x, SR48, ts)
+    assert "".join(tipos) == "AbbbAbbb"
+    assert medidas[0] == pytest.approx(1500, abs=40) and medidas[1] == pytest.approx(1000, abs=40)
+
+
+def test_acentos_um_timbre_so_nao_inventa_acento():
+    tempos = [0.5 + 0.5 * i for i in range(6)]
+    x = _bipes(tempos, [1000] * 6)
+    tipos, _ = audio.acentos(x, SR48, audio.cliques(x, SR48, limiar_relativo=0.25, distancia_min_s=0.2))
+    assert tipos == ["b"] * 6
+
+
+class _GravadorRoteirizado:
+    """Gravador falso: cada `with` devolve a próxima captura do roteiro (motivo de perda ou None)."""
+    roteiro: list[str | None] = []
+    usados: list[int] = []
+
+    def __init__(self, segundos_max: float = 10.0) -> None:
+        self.segundos_max = segundos_max
+
+    def __enter__(self):
+        _GravadorRoteirizado.usados.append(len(_GravadorRoteirizado.usados) + 1)
+        self.motivo_perda = _GravadorRoteirizado.roteiro.pop(0)
+        self.perdeu_entrada = self.motivo_perda is not None
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.sinal = (np.full(10, float(len(_GravadorRoteirizado.usados))), SR48)
+
+
+def _roteiro(monkeypatch, motivos):
+    _GravadorRoteirizado.roteiro = list(motivos)
+    _GravadorRoteirizado.usados = []
+    monkeypatch.setattr(audio, "Gravador", _GravadorRoteirizado)
+
+
+def test_capturar_sem_perda_repete_quando_a_captura_perde(monkeypatch):
+    _roteiro(monkeypatch, ["perdeu 512 quadros", None])
+    tocadas = []
+    cap = audio.capturar_sem_perda(lambda: tocadas.append(1), segundos_max=5)
+    assert len(tocadas) == 2
+    assert cap.perdeu is False and cap.motivo is None
+    assert cap.sinal[0][0] == 2.0  # a captura devolvida é a segunda, a limpa
+    assert len(cap.tentativas) == 1 and "perdeu 512" in cap.tentativas[0]
+
+
+def test_capturar_sem_perda_desiste_depois_das_tentativas(monkeypatch):
+    _roteiro(monkeypatch, ["perda 1", "perda 2", "perda 3"])
+    cap = audio.capturar_sem_perda(lambda: None, segundos_max=5, tentativas=3)
+    assert cap.perdeu is True
+    assert cap.motivo == "perda 3"
+    assert len(cap.tentativas) == 3
+
+
+def test_capturar_sem_perda_conferir_do_cenario_tambem_manda_repetir(monkeypatch):
+    _roteiro(monkeypatch, [None, None])
+    vistos = []
+
+    def conferir(sinal, sr):
+        vistos.append(float(sinal[0]))
+        return "intervalo menor por 11 blocos de 512" if len(vistos) == 1 else None
+
+    cap = audio.capturar_sem_perda(lambda: None, segundos_max=5, conferir=conferir)
+    assert vistos == [1.0, 2.0]
+    assert cap.perdeu is False and len(cap.tentativas) == 1
+
+
+def test_capturar_sem_perda_primeira_limpa_nao_repete(monkeypatch):
+    _roteiro(monkeypatch, [None, "nunca usada"])
+    tocadas = []
+    cap = audio.capturar_sem_perda(lambda: tocadas.append(1), segundos_max=5)
+    assert tocadas == [1] and cap.tentativas == []
+
+
+# ---------------------------------------------------------------------------
 # Fala sintética (SAPI / System.Speech)
 # ---------------------------------------------------------------------------
 

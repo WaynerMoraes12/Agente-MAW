@@ -8,9 +8,13 @@ número.
 from __future__ import annotations
 import base64
 import io
+import math
 import subprocess
 import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -23,6 +27,17 @@ _PS_LISTAR_VOZES = _RECURSOS / "listar_vozes_sapi.ps1"
 _PS_FALAR = _RECURSOS / "falar_sapi.ps1"
 _TAMANHO_BLOCO = 1024  # quadros por leitura do stream de loopback
 _FOLGA_JOIN_S = 5.0  # folga do join() sobre segundos_max, pra dar tempo de uma leitura terminar
+
+# Continuidade da captura. O PortAudio joga fora, sem avisar, o que a leitura não buscou a tempo quando
+# `exception_on_overflow=False`: a captura sai "emendada" (o que tocou depois aparece colado no que tocou
+# antes) e todo intervalo medido nela encolhe. Por isso a leitura pede o aviso de transbordo e, além dele,
+# confere os quadros recebidos contra o relógio do PC (o aviso nem sempre vem, conforme o driver).
+_PA_TRANSBORDO = getattr(pyaudio, "paInputOverflowed", -9981)
+_TRANSBORDOS_SEGUIDOS_MAX = 4  # transbordo em toda leitura: desiste do aviso para não ficar sem áudio nenhum
+_AQUECIMENTO_S = 0.25  # o começo da captura (o stream assentando) fica fora da conta do relógio
+_JANELA_PISO_S = 0.25  # cada trecho em que se procura o piso do atraso (o mínimo filtra o jitter das leituras)
+_LIMIAR_PASSO_S = 0.005  # degrau do piso que conta como perda: menos de meio bloco de 512 a 48 kHz (10,7 ms)
+_relogio = time.perf_counter  # relógio do PC para a conta (trocado nos testes)
 
 
 class LoopbackIndisponivel(Exception):
@@ -51,10 +66,121 @@ def _para_mono(dados: bytes, canais: int) -> np.ndarray:
     return x
 
 
-def captura_loopback(segundos: float) -> tuple[np.ndarray, int]:
+def _eh_transbordo(e: OSError) -> bool:
+    """O OSError que o PyAudio levanta quando o PortAudio avisa que a entrada transbordou (-9981)."""
+    return getattr(e, "errno", None) == _PA_TRANSBORDO or bool(e.args and e.args[0] == _PA_TRANSBORDO)
+
+
+class _Leitor:
+    """Lê blocos de um stream de entrada sem engolir perda: pede o aviso de transbordo ao PortAudio (e
+    continua a gravar depois dele), anota cada leitura (instante em que voltou, quadros acumulados) para
+    conferir contra o relógio, e só desiste do aviso se ele vier em toda leitura — nesse caso o relógio
+    ainda mede a perda. Qualquer outro OSError sobe (o dispositivo caiu)."""
+
+    def __init__(self, stream, canais: int) -> None:
+        self.stream = stream
+        self.canais = max(1, canais)
+        self.blocos: list[bytes] = []
+        self.leituras: list[tuple[float, int]] = []
+        self.transbordos: list[tuple[float, int]] = []
+        self.sem_aviso = False  # o aviso de transbordo veio em toda leitura e foi desligado
+        self._recebidos = 0
+        self._seguidos = 0
+
+    def ler(self, n: int) -> None:
+        try:
+            bloco = self.stream.read(n, exception_on_overflow=not self.sem_aviso)
+        except OSError as e:
+            if not _eh_transbordo(e):
+                raise
+            # o PyAudio descarta o bloco que avisou o transbordo: a perda aparece também no relógio
+            self.transbordos.append((_relogio(), self._recebidos))
+            self._seguidos += 1
+            if self._seguidos >= _TRANSBORDOS_SEGUIDOS_MAX:
+                self.sem_aviso = True
+            return
+        self._seguidos = 0
+        self.blocos.append(bloco)
+        self._recebidos += len(bloco) // (4 * self.canais)
+        self.leituras.append((_relogio(), self._recebidos))
+
+    def continuidade(self, sr: int) -> dict:
+        c = continuidade(self.leituras, sr, self.transbordos)
+        if self.sem_aviso:
+            c["sem_aviso_de_transbordo"] = True
+            if c["motivo"]:
+                c["motivo"] += (f"; o PortAudio avisou transbordo em {_TRANSBORDOS_SEGUIDOS_MAX} leituras seguidas e "
+                                f"a captura seguiu sem o aviso")
+        return c
+
+
+def continuidade(leituras: list[tuple[float, int]], sr: int,
+                 transbordos: list[tuple[float, int]] | tuple = ()) -> dict:
+    """A captura foi contínua no tempo? `leituras`: (instante em que cada read() voltou, no relógio do PC;
+    quadros recebidos até ali); `transbordos`: (instante, quadros recebidos até ali) de cada aviso de
+    transbordo do PortAudio.
+
+    Sem perda, os quadros acompanham o relógio: o atraso D = (t − t0)·sr − quadros só oscila com o que está
+    no buffer na hora da leitura (sempre ≥ 0). Uma perda é um degrau no PISO desse atraso. Por trechos de
+    `_JANELA_PISO_S`, o piso é o mínimo de D no trecho; o piso que vale em cada ponto é o menor dali até o fim
+    (assim uma leitura que só se atrasou, e depois alcançou, não vira perda); cada degrau acima de
+    `_LIMIAR_PASSO_S` é uma perda. Deriva entre o relógio da placa e o do PC é uma rampa suave (degraus
+    pequenos), não perda. O começo (`_AQUECIMENTO_S`) fica de fora, e lá um transbordo é só registrado.
+
+    Devolve {"medida", "perdeu", "transbordos", "quadros_recebidos", "quadros_esperados", "quadros_perdidos",
+    "perdas": [{"em_s", "quadros"}], "duracao_s", "motivo"} — `motivo` é o texto (pt-BR) quando perdeu."""
+    out = {"medida": False, "perdeu": False, "transbordos": len(transbordos), "quadros_recebidos": 0,
+           "quadros_esperados": 0, "quadros_perdidos": 0, "perdas": [], "duracao_s": 0.0, "motivo": None}
+    if not leituras or sr <= 0:
+        return out
+    t0, f0 = leituras[0]
+    t_fim, f_fim = leituras[-1]
+    duracao = t_fim - t0
+    out.update(quadros_recebidos=int(f_fim), quadros_esperados=int(round(f0 + duracao * sr)),
+               duracao_s=round(duracao, 3))
+    aquecimento = min(_AQUECIMENTO_S, duracao * 0.2)
+    validos_transb = [t for t, _ in transbordos if t - t0 >= aquecimento]
+    janela = min(_JANELA_PISO_S, max(duracao, 1e-9) / 4)
+    trechos: dict[int, tuple[float, int]] = {}  # índice do trecho -> (piso do atraso, quadros na leitura do piso)
+    for t, f in leituras:
+        if t - t0 < aquecimento:
+            continue
+        k = int((t - t0 - aquecimento) // janela)
+        d = (t - t0) * sr - f
+        if k not in trechos or d < trechos[k][0]:
+            trechos[k] = (d, f)
+    if len(leituras) >= 4 and duracao >= 0.2 and len(trechos) >= 2:
+        out["medida"] = True
+        chaves = sorted(trechos)
+        pisos = [trechos[k][0] for k in chaves]
+        menor_ate_o_fim = pisos[:]
+        for i in range(len(pisos) - 2, -1, -1):
+            menor_ate_o_fim[i] = min(pisos[i], menor_ate_o_fim[i + 1])
+        limiar = _LIMIAR_PASSO_S * sr
+        for i in range(len(pisos) - 1):
+            degrau = menor_ate_o_fim[i + 1] - menor_ate_o_fim[i]
+            if degrau > limiar:
+                q = int(round(degrau))
+                out["quadros_perdidos"] += q
+                out["perdas"].append({"em_s": round(trechos[chaves[i + 1]][1] / sr, 2), "quadros": q})
+    partes = []
+    if out["quadros_perdidos"]:
+        ms = out["quadros_perdidos"] / sr * 1000
+        onde = ", ".join(f"{p['quadros']} em ~{p['em_s']:.2f} s" for p in out["perdas"][:6])
+        partes.append(f"~{out['quadros_perdidos']} quadros ({ms:.0f} ms) a menos que o relógio ({onde})")
+    if validos_transb:
+        partes.append(f"{len(validos_transb)} transbordo(s) avisado(s) pelo PortAudio")
+    if partes:
+        out["perdeu"] = True
+        out["motivo"] = "a captura do loopback perdeu entrada: " + "; ".join(partes)
+    return out
+
+
+def captura_loopback(segundos: float, continuidade: dict | None = None) -> tuple[np.ndarray, int]:
     """Grava `segundos` do loopback WASAPI da saída padrão. Devolve (sinal_mono, taxa_amostragem).
 
-    Levanta `LoopbackIndisponivel` se não houver loopback ou o stream não abrir.
+    `continuidade`: se vier um dicionário, recebe o resultado de `continuidade()` da captura (perdeu
+    entrada?). Levanta `LoopbackIndisponivel` se não houver loopback ou o stream não abrir.
     """
     p = pyaudio.PyAudio()
     try:
@@ -66,14 +192,14 @@ def captura_loopback(segundos: float) -> tuple[np.ndarray, int]:
                              input_device_index=info["index"], frames_per_buffer=_TAMANHO_BLOCO)
         except OSError as e:
             raise LoopbackIndisponivel(f"não foi possível abrir o loopback: {e}") from e
+        leitor = _Leitor(stream, canais)
         try:
             alvo = int(segundos * sr)
-            blocos: list[bytes] = []
             lidos = 0
             while lidos < alvo:
                 n = min(_TAMANHO_BLOCO, alvo - lidos)
                 try:
-                    blocos.append(stream.read(n, exception_on_overflow=False))
+                    leitor.ler(n)
                 except OSError as e:
                     raise LoopbackIndisponivel(f"a captura do loopback caiu no meio: {e}") from e
                 lidos += n
@@ -82,7 +208,9 @@ def captura_loopback(segundos: float) -> tuple[np.ndarray, int]:
             stream.close()
     finally:
         p.terminate()
-    return _para_mono(b"".join(blocos), canais), sr
+    if continuidade is not None:
+        continuidade.update(leitor.continuidade(sr))
+    return _para_mono(b"".join(leitor.blocos), canais), sr
 
 
 class Gravador:
@@ -98,20 +226,39 @@ class Gravador:
     uma exceção sua — nesse caso a original nunca é substituída, só ganha uma nota sobre a queda
     da captura). Qualquer outra exceção na thread de captura (um bug nosso, não uma falha de
     dispositivo) sobe do `__exit__` como ela mesma, sem virar `LoopbackIndisponivel`.
+
+    Perda de entrada nunca levanta: transbordo avisado pelo PortAudio e quadros a menos que o relógio
+    ficam em `continuidade` (ver `continuidade()`), com `perdeu_entrada`/`motivo_perda` para o cenário
+    decidir — quem mede intervalo na captura repete a gravação (`capturar_sem_perda`) ou pula.
     """
 
     def __init__(self, segundos_max: float = 10.0) -> None:
         self.segundos_max = segundos_max
         self.sinal: tuple[np.ndarray, int] | None = None
         self.limitacao: str | None = None
+        self.continuidade: dict | None = None
         self._p: "pyaudio.PyAudio | None" = None
         self._stream = None
         self._sr = 0
         self._canais = 1
-        self._blocos: list[bytes] = []
+        self._leitor: _Leitor | None = None
         self._parar = threading.Event()
         self._thread: threading.Thread | None = None
         self._erro: BaseException | None = None
+
+    @property
+    def perdeu_entrada(self) -> bool:
+        """A captura perdeu entrada (blocos jogados fora no meio)? False até o `with` terminar."""
+        return bool(self.continuidade and self.continuidade.get("perdeu"))
+
+    @property
+    def motivo_perda(self) -> str | None:
+        """O que a captura perdeu (texto pt-BR), ou None se ela foi contínua."""
+        return self.continuidade.get("motivo") if self.perdeu_entrada else None
+
+    @property
+    def _blocos(self) -> list[bytes]:
+        return self._leitor.blocos if self._leitor is not None else []
 
     def __enter__(self) -> "Gravador":
         self._p = pyaudio.PyAudio()
@@ -129,6 +276,7 @@ class Gravador:
             self._p.terminate()
             self._p = None
             raise
+        self._leitor = _Leitor(self._stream, self._canais)
         self._thread = threading.Thread(target=self._laco, daemon=True)
         self._thread.start()
         return self
@@ -138,7 +286,7 @@ class Gravador:
         lidos = 0
         try:
             while not self._parar.is_set() and lidos < maximo:
-                self._blocos.append(self._stream.read(_TAMANHO_BLOCO, exception_on_overflow=False))
+                self._leitor.ler(_TAMANHO_BLOCO)  # transbordo avisado não levanta: fica anotado no leitor
                 lidos += _TAMANHO_BLOCO
         except Exception as e:  # guarda qualquer coisa; o __exit__ decide o que fazer com ela —
             self._erro = e     # ver ali: só OSError vira LoopbackIndisponivel, o resto sobe como é
@@ -171,6 +319,42 @@ class Gravador:
                 self._erro.add_note("exceção na thread de captura")
             raise self._erro
         self.sinal = (_para_mono(b"".join(self._blocos), self._canais), self._sr)
+        if self._thread is not None and not self._thread.is_alive():
+            # com a thread presa (ver `limitacao`) a lista ainda pode mudar: aí a conta fica de fora
+            self.continuidade = self._leitor.continuidade(self._sr)
+
+
+@dataclass
+class Captura:
+    """O que `capturar_sem_perda` devolve: o sinal da última gravação feita, se ela ainda perdeu entrada (e
+    o motivo), e o motivo de cada tentativa descartada (inclusive a última, quando perdeu)."""
+    sinal: tuple[np.ndarray, int]
+    perdeu: bool
+    motivo: str | None
+    tentativas: list[str] = field(default_factory=list)
+    gravador: object = None
+
+
+def capturar_sem_perda(tocar: Callable[[], None], segundos_max: float = 10.0, tentativas: int = 3,
+                       conferir: Callable[[np.ndarray, int], str | None] | None = None) -> Captura:
+    """Grava o loopback enquanto `tocar()` roda e repete (até `tentativas` vezes) quando a captura perdeu
+    entrada — pelo `Gravador` ou pelo `conferir(sinal, sr)` do cenário, que devolve o motivo de uma perda que
+    ele mesmo viu no sinal (ex.: intervalo menor por blocos inteiros) ou None. Para cenário que mede tempo
+    na captura: uma captura emendada encolhe os intervalos e nunca pode virar achado contra a fonte.
+    Exceções de `tocar()` e do `Gravador` sobem como são."""
+    motivos: list[str] = []
+    g = None
+    motivo = None
+    for n in range(1, max(1, tentativas) + 1):
+        with Gravador(segundos_max=segundos_max) as g:
+            tocar()
+        motivo = g.motivo_perda
+        if motivo is None and conferir is not None:
+            motivo = conferir(*g.sinal)
+        if motivo is None:
+            return Captura(g.sinal, False, None, motivos, g)
+        motivos.append(f"tentativa {n}: {motivo}")
+    return Captura(g.sinal, True, motivo, motivos, g)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +437,46 @@ def cliques(x: np.ndarray, sr: int, limiar_relativo: float = 0.3, distancia_min_
         else:
             i += 1
     return tempos
+
+
+def deficits_em_blocos(intervalos_s, esperados_s, sr: int, bloco: int = 512, folga_s: float = 0.001,
+                       fracao_max: float = 0.4, maioria: float = 0.5) -> list[int]:
+    """Para cada intervalo medido, quantos blocos inteiros de `bloco` amostras faltam nele em relação ao
+    esperado (0 quando não falta um número inteiro de blocos, a ±`folga_s`). É a assinatura de uma captura
+    que jogou blocos fora: o intervalo só encolhe, e sempre de blocos inteiros.
+
+    Só conta como perda da captura o que é esparso e pequeno: um déficit maior que `fracao_max` do intervalo
+    esperado (ex.: andamento errado, 0,5 s no lugar de 1,0 s) nunca conta, e se mais que `maioria` dos
+    intervalos tem déficit, é desvio da fonte, não da captura — devolve tudo zero."""
+    out: list[int] = []
+    for iv, esp in zip(intervalos_s, esperados_s):
+        falta = (float(esp) - float(iv)) * sr
+        k = int(round(falta / bloco)) if bloco > 0 else 0
+        ok = k >= 1 and abs(falta - k * bloco) <= folga_s * sr and falta <= fracao_max * float(esp) * sr
+        out.append(k if ok else 0)
+    if out and sum(1 for k in out if k) > maioria * len(out):
+        return [0] * len(out)
+    return out
+
+
+def acentos(x: np.ndarray, sr: int, tempos: list[float], janela_s: float = 0.015,
+            razao_min: float = 1.2) -> tuple[list[str], list[float]]:
+    """Separa os cliques em `tempos` (de `cliques()`) em acento ('A', o bipe mais agudo — como os metrônomos
+    marcam o 1 do compasso) e batida ('b'), pela frequência dominante dos primeiros `janela_s` de cada um.
+    Devolve (tipos, frequências). Se os cliques não têm duas alturas (a mais aguda menos de `razao_min`
+    vezes a mais grave), não inventa acento: tudo 'b'. Independe dos intervalos entre os cliques — vale
+    mesmo numa captura que perdeu blocos."""
+    x = np.asarray(x, dtype=np.float64)
+    freqs: list[float] = []
+    for t in tempos:
+        a = max(0, int(round((t - 0.002) * sr)))  # o instante do clique é o pico do envelope, logo depois do ataque
+        trecho = x[a:a + max(16, int(janela_s * sr))]
+        freqs.append(freq_dominante(trecho, sr) if trecho.size >= 16 else 0.0)
+    validas = [f for f in freqs if f > 0]
+    if not validas or max(validas) < razao_min * min(validas):
+        return ["b"] * len(freqs), freqs
+    corte = math.sqrt(min(validas) * max(validas))
+    return ["A" if f >= corte else "b" for f in freqs], freqs
 
 
 def atraso_entre(a: np.ndarray, b: np.ndarray, sr: int) -> float:
