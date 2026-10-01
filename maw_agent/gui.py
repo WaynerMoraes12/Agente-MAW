@@ -1817,7 +1817,10 @@ class SessaoApp:
         pops = self._popups()
         if not pops:
             return []
-        itens = self._itens_diretos(pops[0])
+        # o menu que o agente abriu, não o mais recente: com o cursor real em cima de um item a JUCE abre o
+        # submenu dele sozinha (hover), e ele passaria a ser o mais recente
+        atual = getattr(self, "_menu_atual", None)
+        itens = self._itens_diretos(atual if atual in pops else pops[0])
         if itens:
             return itens
         mais_fundo: list[UIAElementInfo] = []
@@ -1872,6 +1875,8 @@ class SessaoApp:
         popup = self._novo_popup(antes, timeout)
         if not popup:
             raise self._menu_sumiu(caminho[0], timeout)
+        self._menu_atual = popup
+        self._cursor_fora_do_menu(popup)
         for nome in caminho[1:]:
             item = self._item(nome)
             antes = set(self._popups())
@@ -1880,10 +1885,23 @@ class SessaoApp:
             popup = self._novo_popup(antes, timeout)
             if not popup:
                 raise self._menu_sumiu(nome, timeout)
+            self._menu_atual = popup
         itens = self.itens_menu()
         if not IsWindow(popup) or not IsWindowVisible(popup):
             raise self._menu_sumiu(caminho[-1], timeout)
         return itens
+
+    def _cursor_fora_do_menu(self, popup: int) -> None:
+        """Com entrada real o cursor fica onde clicou; se o menu abre debaixo dele, o hover abre o submenu do
+        item que está ali. Tira o cursor de cima do menu (para a esquerda e acima dele) antes de ler os itens."""
+        if not entrada_real() or desktop_oculto():
+            return
+        try:
+            l, t, _r, _b = _retangulo(popup)
+            SetCursorPos(max(0, l - 40), max(0, t - 40))
+            time.sleep(0.15)
+        except Exception:  # noqa: BLE001 — só posiciona o cursor: o menu continua utilizável
+            pass
 
     def _menu_sumiu(self, nome, timeout: float) -> ErroApp:
         cap = self._capturar_erro("menu")
@@ -1911,6 +1929,7 @@ class SessaoApp:
         """Esc nos menus abertos até não sobrar nenhum. True se fecharam."""
         esc = interpretar_teclas("esc")
         self._expandido = None
+        self._menu_atual = None
         for _ in range(tentativas):
             pops = self._popups()
             if not pops:

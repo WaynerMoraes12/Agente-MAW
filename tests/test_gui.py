@@ -986,3 +986,15 @@ def test_tecla_real_sem_modificador_vai_num_lote_so(monkeypatch):
     monkeypatch.setattr(gui.time, "sleep", lambda s: None)
     gui._enviar_tecla_real(gui.interpretar_teclas("t"))
     assert lotes == [2]
+
+
+def test_itens_do_menu_vem_do_menu_que_o_agente_abriu(monkeypatch):
+    """Com o cursor real em cima de um item, a JUCE abre o submenu sozinha (hover): o menu mais recente passa a ser
+    esse submenu, que o agente não pediu. Os itens lidos são os do menu que o próprio agente abriu."""
+    s = object.__new__(gui.SessaoApp)
+    s._menu_atual = 111
+    monkeypatch.setattr(gui.SessaoApp, "_popups", lambda self: [222, 111])  # 222: o submenu aberto pelo hover
+    monkeypatch.setattr(gui.SessaoApp, "_itens_diretos", lambda self, h: [f"item-de-{h}"])
+    assert s._itens_abertos() == ["item-de-111"]
+    s._menu_atual = 999  # o menu do agente fechou: vale o mais recente
+    assert s._itens_abertos() == ["item-de-222"]
