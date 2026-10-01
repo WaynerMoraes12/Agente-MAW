@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import bancada, build, catalogo, config, e2e, fases, sandbox
+from . import bancada, build, cache_local, catalogo, config, e2e, fases, sandbox
 from .cli import registrar
 
 
@@ -473,5 +473,8 @@ def cmd_e2e(args: argparse.Namespace) -> int:
     cenarios_todos = e2e.descobrir(config.PRIVADO / "cenarios")
     cenarios_filtrados = _filtrar_cenarios(cenarios_todos, args.cenario, args.arquivo)
     if args.avulso:
-        return _rodar_avulso(args, cenarios_filtrados)
-    return _rodar_sprint(args, cenarios_todos, cenarios_filtrados)
+        with cache_local.temporario(lambda t: print(f"[e2e] {t}", file=sys.stderr, flush=True)):
+            return _rodar_avulso(args, cenarios_filtrados)
+    e = fases._sprint_atual()
+    with cache_local.temporario(lambda t: _acrescentar_limitacoes(e, [t])):
+        return _rodar_sprint(args, cenarios_todos, cenarios_filtrados)

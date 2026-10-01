@@ -38,7 +38,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import achados, catalogo, config, estado, fases, sandbox, servico, suite, trava_appdata
+from . import achados, cache_local, catalogo, config, estado, fases, sandbox, servico, suite, trava_appdata
 from .cli import registrar
 
 _MOTIVO_NA = ("o script do serviço deste alvo não usa o token de quem chama: a funcionalidade não existe "
@@ -707,7 +707,8 @@ def cmd_servico(args: argparse.Namespace) -> int:
     resultados = []
     ok_geral = True
     for a in pendentes:
-        r = _servico_de_um_alvo(e, a, dados_cenarios, itens_servico)
+        with cache_local.temporario(lambda x: _acrescentar_limitacoes(e, "servico", [x])):
+            r = _servico_de_um_alvo(e, a, dados_cenarios, itens_servico)
         # itens sem checagem: nao_testavel também para quem rodou (não silenciosamente ausente)
         for item in faltando:
             catalogo.registrar_resultado(e.pasta, item, a["nome"], "nao_testavel",
