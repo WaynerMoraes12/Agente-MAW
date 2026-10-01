@@ -1144,3 +1144,45 @@ def test_marca_interativa_velha_e_ignorada(tmp_path):
            dormir=lambda s: (_ for _ in ()).throw(AssertionError("não devia esperar")))
     assert falso.ordem[-3:] == ["consolidar", "encerrar", "relatorio"]
     assert N.MSG_SEM_CONFIANCA in _lims(pasta)
+
+
+# ---------- pacote de correção no fim da noite ----------
+
+def _sprint_com_pdf(tmp_path, achados):
+    e = estado.Estado(tmp_path / "relatorios" / "sprint-07", 7)
+    e.pasta.mkdir(parents=True)
+    e.salvar()
+    e.concluir("relatorio", {})
+    (e.pasta / "MAW-Sprint-07.pdf").write_bytes(b"%PDF-1.4 falso")
+    (e.pasta / "achados.json").write_text(json.dumps(achados), encoding="utf-8")
+    return e.pasta
+
+
+def test_pacote_leva_o_pdf_e_so_os_achados_abertos(tmp_path):
+    pasta = _sprint_com_pdf(tmp_path, [
+        {"id": "MAW-0001", "estado": "novo", "titulo": "a", "severidade": "baixa", "alvos": [{"alvo": "main"}]},
+        {"id": "MAW-0002", "estado": "corrigido", "titulo": "b", "severidade": "alta", "alvos": [{"alvo": "main"}]},
+        {"id": "MAW-0003", "estado": "regressao", "titulo": "c", "severidade": "media", "alvos": [{"alvo": "main"}]}])
+    (tmp_path / "entrega").mkdir()
+    (tmp_path / "entrega" / "modelo-pedido.md").write_text("Sprint {sprint}: {n_abertos} ({ids}) em {pasta}",
+                                                         encoding="utf-8")
+    destino = N.montar_pacote(pasta, tmp_path / "entrega")
+    assert destino == tmp_path / "entrega" / "sprint-07"
+    assert (destino / "MAW-Sprint-07.pdf").read_bytes() == b"%PDF-1.4 falso"
+    abertos = json.loads((destino / "achados-abertos.json").read_text(encoding="utf-8"))
+    assert [a["id"] for a in abertos] == ["MAW-0001", "MAW-0003"]
+    assert "MAW-0003" in (destino / "achados-abertos.md").read_text(encoding="utf-8")
+    assert (destino / "pedido.md").read_text(encoding="utf-8") == f"Sprint sprint-07: 2 (MAW-0001, MAW-0003) em {destino}"
+
+
+def test_pacote_sem_modelo_nao_escreve_pedido_e_sem_pdf_nao_monta(tmp_path):
+    pasta = _sprint_com_pdf(tmp_path, [{"id": "MAW-0001", "estado": "aberto", "titulo": "a", "alvos": []}])
+    destino = N.montar_pacote(pasta, tmp_path / "entrega")
+    assert (destino / "achados-abertos.json").exists() and not (destino / "pedido.md").exists()
+    (pasta / "MAW-Sprint-07.pdf").unlink()
+    assert N.montar_pacote(pasta, tmp_path / "entrega2") is None
+
+
+def test_pacote_sem_achado_aberto_nao_monta(tmp_path):
+    pasta = _sprint_com_pdf(tmp_path, [{"id": "MAW-0001", "estado": "corrigido", "titulo": "a", "alvos": []}])
+    assert N.montar_pacote(pasta, tmp_path / "entrega") is None

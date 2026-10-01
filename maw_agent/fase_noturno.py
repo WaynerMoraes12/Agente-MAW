@@ -48,7 +48,7 @@ LIMITE_NOTA = 1000
 PROMPT_REVISAO = "/sprint --retomar --ate revisao --noturno"
 PROMPT_FINAL = "/sprint --retomar --noturno"
 LIMITE_MANHA = "07:00"   # depois disso nada que abre a MAW começa (e a E2E com entrada real é cortada)
-INICIO_NOITE = "20:00"   # antes disso, em modo automático, a entrada real fica desligada
+INICIO_NOITE = "19:00"   # antes disso, em modo automático, a entrada real fica desligada
 PRAZO_FINAL = "11:00"    # a noite termina antes disso, com o relatório (bem antes do PT14H da tarefa)
 TERMINA_NA_TAREFA = "PT14H"  # o Agendador encerra a execução que passar disso
 
@@ -1125,6 +1125,43 @@ def _ensaio(reg, executar, env, raiz, cl, disponiveis, acoes, lims, verificar, s
                    "plano": [f"{a}:{e.nome}" for a, e in acoes], "limitacoes": lims}, ok)
 
 
+ESTADOS_ABERTOS = ("novo", "aberto", "regressao")
+PASTA_PACOTE = config.WORK / "entrega"
+
+
+def montar_pacote(pasta_sprint: Path, destino: Path = PASTA_PACOTE) -> Path | None:
+    """Pacote de correção da sprint concluída, numa pasta local fora dos repositórios: o PDF, os achados abertos
+    (JSON completo e lista legível) e, se houver um modelo local `modelo-pedido.md` em `destino`, o pedido
+    preenchido ({sprint}, {pasta}, {pdf}, {n_abertos}, {ids}). Sem PDF ou sem achado aberto, não monta (None)."""
+    pasta_sprint, destino = Path(pasta_sprint), Path(destino)
+    e = _estado(pasta_sprint)
+    pdfs = sorted(pasta_sprint.glob("MAW-Sprint-*.pdf"))
+    if e is None or not e.feito("relatorio") or not pdfs:
+        return None
+    try:
+        achados_sprint = json.loads((pasta_sprint / "achados.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    abertos = [a for a in achados_sprint if isinstance(a, dict) and a.get("estado") in ESTADOS_ABERTOS]
+    if not abertos:
+        return None
+    alvo = sandbox.criar_pasta(destino / pasta_sprint.name)
+    sandbox.escrever_bytes(alvo / pdfs[-1].name, pdfs[-1].read_bytes())
+    sandbox.escrever_json(alvo / "achados-abertos.json", abertos)
+    linhas = [f"# Achados abertos da {pasta_sprint.name}", ""]
+    for a in abertos:
+        alvos = ", ".join(x.get("alvo", "?") for x in a.get("alvos") or [])
+        linhas.append(f"- **{a.get('id')}** ({a.get('estado')}, {a.get('severidade') or 'sem severidade'}; "
+                      f"{alvos}): {a.get('titulo')}")
+    sandbox.escrever_texto(alvo / "achados-abertos.md", "\n".join(linhas) + "\n")
+    modelo = destino / "modelo-pedido.md"
+    if modelo.exists():
+        texto = modelo.read_text(encoding="utf-8").format(
+            sprint=pasta_sprint.name, pasta=alvo, pdf=alvo / pdfs[-1].name, n_abertos=len(abertos),
+            ids=", ".join(str(a.get("id")) for a in abertos))
+        sandbox.escrever_texto(alvo / "pedido.md", texto)
+    return alvo
+
 def _estado(pasta: Path | None) -> estado.Estado | None:
     if pasta is None or not (Path(pasta) / "estado.json").exists():
         return None
@@ -1242,6 +1279,13 @@ class _Noite:
             self.rede_de_seguranca(e)
         e = _estado(self.pasta)
         pdf = bool(e and e.feito("relatorio"))
+        if pdf and not self.op.ensaio:
+            try:
+                pacote = montar_pacote(e.pasta)
+                if pacote is not None:
+                    self.reg.linha(f"pacote de correção pronto em {pacote}")
+            except Exception as ex:  # noqa: BLE001 — o pacote é extra: a noite termina com o PDF de qualquer jeito
+                self.reg.linha(f"pacote de correção não foi montado: {type(ex).__name__}: {ex}")
         self.reg.linha(f"=== execução noturna terminou: {'PDF gerado' if pdf else 'SEM PDF'} ===")
         return _saida({"ok": pdf, "sprint": e.nome if e else None, "log": str(self.reg.caminho),
                        "etapas": self.resumo}, pdf)
