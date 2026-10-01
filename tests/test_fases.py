@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 from maw_agent import achados, estado, fases
 
@@ -726,3 +727,41 @@ def test_reverificacao_automatica_do_servico_checagem_sem_resultado_nao_verifica
     _gravar(tmp_path, "estado.json", {"passos": {"servico:main": {"status": "concluido", "detalhe": {
         "checagens": [{"id": "sem-resultado", "ok": None, "problemas": []}]}}}})
     assert fases.reverificacoes_automaticas(h, ALVOS_SPRINT, tmp_path) == {"MAW-0001": "nao_verificavel"}
+
+
+# ---------- modo da revisão de código: completa (semanal) ou pelo diff desde a sprint anterior ----------
+
+def _sprint_falsa(raiz, n, passos, main=None):
+    p = raiz / f"sprint-{n:02d}"
+    p.mkdir(parents=True)
+    (p / "estado.json").write_text(json.dumps({"numero": n, "passos": passos}), encoding="utf-8")
+    if main:
+        (p / "alvos.json").write_text(json.dumps({"alvos": [{"nome": "main", "commit": main}]}), encoding="utf-8")
+    return p
+
+
+def test_revisao_completa_quando_nunca_houve_uma(tmp_path):
+    _sprint_falsa(tmp_path, 1, {}, main="a" * 40)
+    atual = _sprint_falsa(tmp_path, 2, {})
+    r = fases.modo_da_revisao(estado.carregar(atual), agora=datetime(2026, 10, 1, 22, 0))
+    assert r["modo"] == "completa" and r["ultima_completa"] is None and r["base_main"] == "a" * 40
+
+
+def test_revisao_pelo_diff_quando_a_completa_e_recente(tmp_path):
+    _sprint_falsa(tmp_path, 1, {"revisao_completa": {"status": "concluido", "fim": "2026-09-28T23:00:00"}},
+                  main="a" * 40)
+    _sprint_falsa(tmp_path, 2, {}, main="b" * 40)
+    atual = _sprint_falsa(tmp_path, 3, {})
+    r = fases.modo_da_revisao(estado.carregar(atual), agora=datetime(2026, 10, 1, 22, 0))
+    assert r == {"modo": "diff", "ultima_completa": "2026-09-28T23:00:00", "base_main": "b" * 40}
+
+
+def test_revisao_completa_depois_de_sete_dias(tmp_path):
+    _sprint_falsa(tmp_path, 1, {"revisao_completa": {"status": "concluido", "fim": "2026-09-20T23:00:00"}})
+    atual = _sprint_falsa(tmp_path, 2, {})
+    assert fases.modo_da_revisao(estado.carregar(atual), agora=datetime(2026, 10, 1, 22, 0))["modo"] == "completa"
+
+
+def test_revisao_completa_ja_feita_nesta_sprint_continua_completa(tmp_path):
+    atual = _sprint_falsa(tmp_path, 1, {"revisao_completa": {"status": "concluido", "fim": "2026-10-01T22:30:00"}})
+    assert fases.modo_da_revisao(estado.carregar(atual), agora=datetime(2026, 10, 1, 23, 0))["modo"] == "completa"

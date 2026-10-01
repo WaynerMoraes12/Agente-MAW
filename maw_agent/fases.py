@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -1668,11 +1669,39 @@ def _relatorio(args) -> int:
     return _saida({"pdf": str(destino), "achados_anexados": ctx["achados_anexados"]})
 
 
+REVISAO_COMPLETA_A_CADA = timedelta(days=7)
+
+
+def modo_da_revisao(e: estado.Estado, agora: datetime | None = None) -> dict:
+    """Como os especialistas revisam o código nesta sprint. 'diff': o que mudou no main desde a sprint anterior
+    (`base_main`) mais a reverificação. 'completa': o código inteiro das áreas, arquivo por arquivo — quando
+    nenhuma sprint marcou `revisao_completa` nos últimos 7 dias (defeito antigo em código que ninguém mexe não
+    aparece no diff). A sprint que faz a completa marca `sprint marcar revisao_completa`."""
+    agora = agora or datetime.now()
+    ultima, base = None, None
+    for pasta in reversed(estado._existentes(e.pasta.parent)):
+        d = _ler_json(pasta / "estado.json") or {}
+        fim = ((d.get("passos") or {}).get("revisao_completa") or {})
+        if fim.get("status") == "concluido" and fim.get("fim") and (ultima is None or fim["fim"] > ultima):
+            ultima = fim["fim"]
+        if base is None and pasta != e.pasta:
+            alvos = (_ler_json(pasta / "alvos.json") or {}).get("alvos") or []
+            base = next((a.get("commit") for a in alvos if a.get("nome") == "main"), None)
+    feita_aqui = ((e.passos.get("revisao_completa") or {}).get("status") == "concluido")
+    try:
+        recente = ultima is not None and agora - datetime.fromisoformat(ultima) < REVISAO_COMPLETA_A_CADA
+    except ValueError:
+        recente = False
+    modo = "completa" if feita_aqui or not recente else "diff"
+    return {"modo": modo, "ultima_completa": ultima, "base_main": base}
+
+
 def _status(args) -> int:
     e = estado.em_andamento()
     if e is None:
         return _saida({"em_andamento": None})
-    return _saida({"sprint": e.nome, "passos": e.passos, "restauracoes": e.restauracoes})
+    return _saida({"sprint": e.nome, "passos": e.passos, "restauracoes": e.restauracoes,
+                   "revisao": modo_da_revisao(e)})
 
 
 # passos que só a própria fase da CLI conclui (nunca `sprint marcar`)
