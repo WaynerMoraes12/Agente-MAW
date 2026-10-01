@@ -1186,3 +1186,21 @@ def test_pacote_sem_modelo_nao_escreve_pedido_e_sem_pdf_nao_monta(tmp_path):
 def test_pacote_sem_achado_aberto_nao_monta(tmp_path):
     pasta = _sprint_com_pdf(tmp_path, [{"id": "MAW-0001", "estado": "corrigido", "titulo": "a", "alvos": []}])
     assert N.montar_pacote(pasta, tmp_path / "entrega") is None
+
+
+def test_marca_interativa_criada_depois_do_inicio_tambem_vale(tmp_path):
+    """A sessão interativa pode chegar com a noite já rodando: a marca criada no meio ainda faz a rede esperar."""
+    pasta = _sprint(tmp_path)
+    esperas = []
+
+    def ao_servico(_et):
+        _marca_interativa(tmp_path)
+
+    def dormir(seg):
+        esperas.append(seg)
+        _marcar(pasta, "consolidar", "encerrar", "relatorio")(None)
+
+    falso = Falso(pasta, ao_rodar={"servico": ao_servico})
+    _rodar(tmp_path, falso, confianca=lambda: False, dormir=dormir)
+    assert not {"consolidar", "encerrar", "relatorio"} & set(falso.ordem)
+    assert esperas

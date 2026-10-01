@@ -1272,6 +1272,10 @@ class _Noite:
                          f"{_duracao(RESERVA_RELATORIO)} guardada para o relatório): não rodaram "
                          + ", ".join(self.pulados_por_prazo))
         e = _estado(self.pasta)
+        if self.interativa is None and marca_interativa_valida(self.reg.caminho.parent):
+            # a sessão interativa chegou com a noite já rodando: a marca criada no meio também vale
+            self.interativa = self.reg.caminho.parent / MARCA_INTERATIVA
+            self.reg.linha(f"marca {MARCA_INTERATIVA} criada durante a noite: a sessão interativa julga esta noite")
         if e is not None and not e.feito("relatorio") and self.interativa is not None:
             self.esperar_sessao_interativa()
             e = _estado(self.pasta)
