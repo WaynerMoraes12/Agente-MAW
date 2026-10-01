@@ -22,17 +22,40 @@ def carregar(pasta_sprint: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def registrar(pasta_sprint: Path, codigo: str, estado: str, nota: str, alvo: str) -> None:
+def _juntar_um(atual: dict | None, estado: str, nota: str, alvo: str) -> dict:
+    """Uma contribuição a mais num código: o pior estado vence (e leva o alvo), as notas se juntam."""
     if estado not in _ORDEM_ESTADO:
         raise ValueError(f"estado inválido: {estado!r} (use {', '.join(ESTADOS)})")
-    dados = carregar(pasta_sprint)
-    atual = dados.get(codigo)
     if atual is None:
-        dados[codigo] = {"estado": estado, "nota": nota, "alvo": alvo}
-    else:
-        pior_vence = _ORDEM_ESTADO[estado] > _ORDEM_ESTADO[atual["estado"]]
-        notas = [n for n in (atual.get("nota"), nota) if n]
-        dados[codigo] = {"estado": estado if pior_vence else atual["estado"],
-                         "nota": "; ".join(dict.fromkeys(notas)),
-                         "alvo": alvo if pior_vence else atual["alvo"]}
+        return {"estado": estado, "nota": nota, "alvo": alvo}
+    pior_vence = _ORDEM_ESTADO[estado] > _ORDEM_ESTADO[atual["estado"]]
+    notas = [n for n in (atual.get("nota"), nota) if n]
+    return {"estado": estado if pior_vence else atual["estado"],
+            "nota": "; ".join(dict.fromkeys(notas)),
+            "alvo": alvo if pior_vence else atual["alvo"]}
+
+
+def registrar(pasta_sprint: Path, codigo: str, estado: str, nota: str, alvo: str) -> None:
+    dados = carregar(pasta_sprint)
+    dados[codigo] = _juntar_um(dados.get(codigo), estado, nota, alvo)
     sandbox.escrever_json(Path(pasta_sprint) / "bancada.json", dados)
+
+
+def juntar(contribuicoes: list[tuple[str, str, str]]) -> dict | None:
+    """O que `registrar` deixaria num código depois destas contribuições (estado, nota, alvo), em ordem."""
+    atual = None
+    for estado, nota, alvo in contribuicoes:
+        atual = _juntar_um(atual, estado, nota, alvo)
+    return atual
+
+
+def reconstruir(pasta_sprint: Path, codigo: str, contribuicoes: list[tuple[str, str, str]]) -> dict | None:
+    """Refaz um código do zero a partir das contribuições (a consolidação, quando uma delas mudou — ex.: o
+    achado de um cenário derrubado na verificação adversarial). Sem contribuição, não mexe e devolve None."""
+    novo = juntar(contribuicoes)
+    if novo is None:
+        return None
+    dados = carregar(pasta_sprint)
+    dados[codigo] = novo
+    sandbox.escrever_json(Path(pasta_sprint) / "bancada.json", dados)
+    return novo

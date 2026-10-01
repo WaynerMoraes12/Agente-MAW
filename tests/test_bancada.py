@@ -56,3 +56,29 @@ def test_varios_codigos_independentes(tmp_path):
     bancada.registrar(tmp_path, "b", "pulei", "sem guitarra", "main")
     d = bancada.carregar(tmp_path)
     assert set(d) == {"a", "b"} and d["a"]["estado"] == "passou" and d["b"]["estado"] == "pulei"
+
+
+# ---------- reconstruir um código a partir das contribuições (consolidação) ----------
+
+def test_juntar_aplica_a_mesma_regra_de_registrar_em_sequencia(tmp_path):
+    contrib = [("passou", "tela ok", "main"), ("pulei", "mediu errado", "main"), ("passou", "tela ok", "main")]
+    for estado, nota, alvo in contrib:
+        bancada.registrar(tmp_path, "x", estado, nota, alvo)
+    assert bancada.juntar(contrib) == bancada.carregar(tmp_path)["x"]
+    assert bancada.juntar(contrib)["estado"] == "pulei"
+    assert bancada.juntar([]) is None
+
+
+def test_reconstruir_troca_so_o_codigo_pedido(tmp_path):
+    bancada.registrar(tmp_path, "x", "problema", "quebrou", "main")
+    bancada.registrar(tmp_path, "y", "passou", "ok", "main")
+    novo = bancada.reconstruir(tmp_path, "x", [("passou", "tela ok", "main"), ("pulei", "mediu errado", "main")])
+    d = bancada.carregar(tmp_path)
+    assert novo == d["x"] == {"estado": "pulei", "nota": "tela ok; mediu errado", "alvo": "main"}
+    assert d["y"] == {"estado": "passou", "nota": "ok", "alvo": "main"}
+
+
+def test_reconstruir_sem_contribuicao_nao_mexe(tmp_path):
+    bancada.registrar(tmp_path, "x", "problema", "quebrou", "main")
+    assert bancada.reconstruir(tmp_path, "x", []) is None
+    assert bancada.carregar(tmp_path)["x"]["estado"] == "problema"
