@@ -548,3 +548,162 @@ def test_varrer_gravacoes_apaga_so_audio_dentro_de_pastas_audio(sprint, tmp_path
     assert fase_e2e._varrer_gravacoes(sprint.pasta / "evidencias") == 2
     assert not (ev / "proj_Audio" / "take1.wav").exists() and not (ev / "proj_Audio" / "sub" / "take2.flac").exists()
     assert (ev / "captura.png").exists() and (ev / "exportado.wav").exists()
+
+
+# ---------- consolidação: achado da E2E derrubado na verificação adversarial ----------
+
+CENARIO_MEDE = '''
+    from maw_agent.e2e import cenario, Resultado
+
+    @cenario(id="area/mede", itens=["area/y", "area/z"], bancada=["cod-x"], alvos=["main"])
+    def test_mede(ctx):
+        return Resultado("problema", "mediu intervalo curto", esperado="0,5 s", obtido="0,383 s")
+'''
+
+CENARIO_TELA = '''
+    from maw_agent.e2e import cenario, Resultado
+
+    @cenario(id="area/tela", itens=["area/x"], bancada=["cod-x"], alvos=["main"])
+    def test_tela(ctx):
+        return Resultado("passou", "a grade muda na marca")
+'''
+
+JUSTIFICATIVA = "O problema está na medição do cenário, não na MAW. A captura perdeu blocos inteiros de 512."
+MOTIVO = ("o cenário area/mede mediu errado (achado derrubado na verificação adversarial): O problema está na "
+          "medição do cenário, não na MAW.")
+
+
+def _passos_sem_itens(pasta: Path) -> None:
+    """Passos como a fase e2e de antes desta versão os gravava: só estado e nota."""
+    s = estado.carregar(pasta)
+    for chave, p in s.passos.items():
+        if chave.startswith("e2e:") and p.get("detalhe"):
+            p["detalhe"] = {"estado": p["detalhe"]["estado"], "nota": p["detalhe"]["nota"]}
+    s.salvar()
+
+
+@pytest.fixture
+def derrubado(sprint, tmp_path, monkeypatch):
+    """E2E com area/mede (problema, itens area/y e area/z) e area/tela (passou) no mesmo código cod-x, mapa da
+    bancada falso e o veredito do advogado derrubando o achado de area/mede."""
+    monkeypatch.setattr(config, "HISTORICO", tmp_path / "historico" / "achados.json")
+    _escrever(config.PRIVADO / "cenarios", "mede.py", CENARIO_MEDE)
+    _escrever(config.PRIVADO / "cenarios", "tela.py", CENARIO_TELA)
+    sandbox.escrever_texto(config.PRIVADO / "bancada" / "mapa.yaml", yaml.safe_dump(
+        {"cod-x": {"cenarios": ["area/mede", "area/tela"], "itens": ["area/x", "area/y", "area/z"], "onde": "main"}}))
+    fase_e2e.cmd_e2e(Args())
+    assert bancada.carregar(sprint.pasta)["cod-x"]["estado"] == "problema"
+    sandbox.escrever_json(sprint.pasta / "vereditos" / "e2e-main-area-mede.json",
+                          {"resultado": "derrubado", "justificativa": JUSTIFICATIVA})
+    return sprint
+
+
+def test_e2e_grava_itens_e_codigos_da_bancada_no_passo(sprint):
+    _escrever(config.PRIVADO / "cenarios", "mede.py", CENARIO_MEDE)
+    fase_e2e.cmd_e2e(Args())
+    d = estado.carregar(sprint.pasta).dados("e2e:main:area/mede")
+    assert d["itens"] == ["area/y", "area/z"] and d["bancada"] == ["cod-x"] and d["bancada_alvo"] == "main"
+
+
+def test_consolidar_derrubado_da_e2e_vira_nao_testavel_na_matriz(derrubado):
+    fases._consolidar(None)
+    r = _resultados(derrubado)
+    for item in ("area/y", "area/z"):
+        assert r[(item, "main")] == {"item": item, "alvo": "main", "resultado": "nao_testavel", "motivo": MOTIVO,
+                                     "achados": [], "fonte": "verificacao"}
+        # docs-z compartilha a árvore de main: a célula herdada segue a de main
+        assert r[(item, "docs-z")]["resultado"] == "nao_testavel"
+        assert r[(item, "docs-z")]["motivo"] == f"mesma árvore de código de main: {MOTIVO}"
+    assert r[("area/x", "main")]["resultado"] == "passou"  # o outro cenário não muda
+    assert json.loads((derrubado.pasta / "achados.json").read_text(encoding="utf-8")) == []
+
+
+def test_consolidar_derrubado_da_e2e_refaz_o_codigo_da_bancada(derrubado):
+    fases._consolidar(None)
+    b = bancada.carregar(derrubado.pasta)["cod-x"]
+    assert b["estado"] == "pulei" and b["alvo"] == "main"
+    assert MOTIVO in b["nota"] and "a grade muda na marca" in b["nota"]
+    assert "mediu intervalo curto" not in b["nota"]
+
+
+def test_consolidar_derrubado_da_e2e_e_idempotente(derrubado):
+    fases._consolidar(None)
+    jsonl = (derrubado.pasta / "resultados.jsonl").read_text(encoding="utf-8")
+    banc = bancada.carregar(derrubado.pasta)
+    fases._consolidar(None)
+    assert (derrubado.pasta / "resultados.jsonl").read_text(encoding="utf-8") == jsonl
+    assert bancada.carregar(derrubado.pasta) == banc
+    assert estado.carregar(derrubado.pasta).dados("consolidar")["derrubados_e2e"]["celulas"] == 4
+
+
+def test_consolidar_derrubado_sem_itens_no_passo_descobre_os_cenarios(derrubado):
+    """Passos gravados por uma fase e2e de antes desta versão (sem itens/bancada): a consolidação lê o que o
+    cenário declara."""
+    _passos_sem_itens(derrubado.pasta)
+    fases._consolidar(None)
+    r = _resultados(derrubado)
+    assert r[("area/z", "main")]["resultado"] == "nao_testavel"
+    assert bancada.carregar(derrubado.pasta)["cod-x"]["estado"] == "pulei"
+
+
+def test_consolidar_derrubado_sem_cenarios_legiveis_usa_o_mapa_e_avisa(derrubado, monkeypatch):
+    _passos_sem_itens(derrubado.pasta)
+
+    def quebra(raiz):
+        raise SyntaxError("cenário quebrado (teste)")
+
+    monkeypatch.setattr(fases.e2e, "descobrir", quebra)
+    fases._consolidar(None)
+    r = _resultados(derrubado)
+    assert r[("area/y", "main")]["resultado"] == "nao_testavel"  # o item do achado
+    assert bancada.carregar(derrubado.pasta)["cod-x"]["estado"] == "pulei"  # o mapa liga cod-x aos dois cenários
+    erros = json.loads((derrubado.pasta / "erros_agente.json").read_text(encoding="utf-8"))
+    assert any("cenário quebrado" in m for m in erros)
+
+
+def test_consolidar_veredito_confirmado_nao_mexe(derrubado):
+    sandbox.escrever_json(derrubado.pasta / "vereditos" / "e2e-main-area-mede.json", {"resultado": "confirmado"})
+    fases._consolidar(None)
+    assert _resultados(derrubado)[("area/y", "main")]["fonte"] == "consolidacao"  # o achado confirmado manda
+    assert _resultados(derrubado)[("area/y", "main")]["resultado"] == "falhou"
+    assert bancada.carregar(derrubado.pasta)["cod-x"]["estado"] == "problema"
+
+
+def test_consolidar_veredito_que_volta_atras_desfaz_a_troca(derrubado):
+    fases._consolidar(None)
+    sandbox.escrever_json(derrubado.pasta / "vereditos" / "e2e-main-area-mede.json", {"resultado": "confirmado"})
+    fases._consolidar(None)
+    r = _resultados(derrubado)
+    assert r[("area/z", "main")]["resultado"] == "falhou" and r[("area/z", "main")]["fonte"] == "e2e"
+    assert bancada.carregar(derrubado.pasta)["cod-x"]["estado"] == "problema"
+
+
+def test_consolidar_cenario_refeito_que_passou_nao_vira_pulei(derrubado):
+    """O cenário derrubado rodou de novo e passou (o achado bruto antigo ainda está lá): vale o que rodou."""
+    s = estado.carregar(derrubado.pasta)
+    s.passos["e2e:main:area/mede"]["detalhe"].update(estado="passou", nota="")
+    s.salvar()
+    for item in ("area/y", "area/z"):
+        catalogo.registrar_resultado(derrubado.pasta, item, "main", "passou", None, fonte="e2e")
+    fases._consolidar(None)
+    r = _resultados(derrubado)
+    assert r[("area/y", "main")]["resultado"] == "passou"
+    assert bancada.carregar(derrubado.pasta)["cod-x"]["estado"] == "passou"
+
+
+def test_consolidar_preserva_linha_de_verificacao_escrita_a_mao(derrubado):
+    manual = ("não verificado: o driver de entrada real falhou (erro do agente; o achado e2e-main-x foi derrubado na "
+              "verificação adversarial)")
+    catalogo.registrar_resultado(derrubado.pasta, "area/x", "main", "nao_testavel", manual, fonte="verificacao")
+    fases._consolidar(None)
+    fases._consolidar(None)
+    r = _resultados(derrubado)
+    assert r[("area/x", "main")]["motivo"] == manual and r[("area/x", "main")]["fonte"] == "verificacao"
+
+
+def test_primeira_frase_da_justificativa():
+    assert fases._primeira_frase(JUSTIFICATIVA) == "O problema está na medição do cenário, não na MAW."
+    assert fases._primeira_frase("sem ponto final") == "sem ponto final"
+    assert fases._primeira_frase("") == ""
+    assert fases._primeira_frase("Arquivo editar.py:753 e 0.5 s medidos. Depois.") == \
+        "Arquivo editar.py:753 e 0.5 s medidos."

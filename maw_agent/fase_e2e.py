@@ -187,6 +187,14 @@ def _binario_da_sprint(e, nome: str) -> tuple[bool, str]:
                                 (e.passos.get(f"compilar:{nome}:Release") or {}).get("inicio"))
 
 
+def _detalhe_do_passo(c: e2e.Cenario, resultado: e2e.Resultado, alvo_bancada: str | None) -> dict:
+    """O que fica no passo `e2e:<alvo>:<id>`: o resultado e, para a consolidação refazer a matriz e a bancada
+    quando o achado do cenário é derrubado, os itens do catálogo e os códigos da bancada que ele alimentou
+    (`bancada_alvo`: o alvo com que entrou na bancada, ou None quando não entrou)."""
+    return {"estado": resultado.estado, "nota": resultado.nota, "itens": list(c.itens), "bancada": list(c.bancada),
+            "bancada_alvo": alvo_bancada}
+
+
 def _pular_sem_binario(e, c: e2e.Cenario, alvo: dict, motivo: str) -> dict:
     """Cenário de um alvo sem o Release desta sprint: `pulei` com o motivo, célula não testável, nenhum
     achado. Na bancada entra como `pulei` com o mesmo motivo (o usuário vê por que não rodou)."""
@@ -200,9 +208,9 @@ def _pular_sem_binario(e, c: e2e.Cenario, alvo: dict, motivo: str) -> dict:
     if alvo_bancada is not None:
         for codigo in c.bancada:
             bancada.registrar(e.pasta, codigo, resultado.estado, resultado.nota, alvo_bancada)
-    detalhe = {"estado": resultado.estado, "nota": resultado.nota}
+    detalhe = _detalhe_do_passo(c, resultado, alvo_bancada)
     e.concluir(passo, detalhe)
-    return {"alvo": nome, "cenario": c.id, **detalhe}
+    return {"alvo": nome, "cenario": c.id, "estado": detalhe["estado"], "nota": detalhe["nota"]}
 
 
 def _rodar_um(e, c: e2e.Cenario, alvo: dict, requisitos_ausentes: set[str]) -> dict:
@@ -224,9 +232,9 @@ def _rodar_um(e, c: e2e.Cenario, alvo: dict, requisitos_ausentes: set[str]) -> d
     if alvo_bancada is not None:
         for codigo in c.bancada:
             bancada.registrar(e.pasta, codigo, resultado.estado, resultado.nota, alvo_bancada)
-    detalhe = {"estado": resultado.estado, "nota": resultado.nota}
+    detalhe = _detalhe_do_passo(c, resultado, alvo_bancada)
     e.concluir(passo, detalhe)
-    return {"alvo": nome, "cenario": c.id, **detalhe}
+    return {"alvo": nome, "cenario": c.id, "estado": detalhe["estado"], "nota": detalhe["nota"]}
 
 
 def _propagar_heranca(e) -> None:

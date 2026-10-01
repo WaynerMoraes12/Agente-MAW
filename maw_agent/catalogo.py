@@ -57,13 +57,18 @@ def registrar_resultado(pasta_sprint: Path, item: str, alvo: str, resultado: str
     sandbox.escrever_texto(p, anterior + linha + "\n")
 
 
-def descartar_fonte(pasta_sprint: Path, fonte: str) -> None:
-    """Tira de resultados.jsonl as linhas gravadas por `fonte` (a consolidação refaz as suas)."""
+def descartar_fonte(pasta_sprint: Path, fonte: str, se=None) -> None:
+    """Tira de resultados.jsonl as linhas gravadas por `fonte` (a consolidação refaz as suas). Com `se`
+    (função da linha → bool), só as linhas dessa fonte para as quais ela diz True."""
     p = Path(pasta_sprint) / "resultados.jsonl"
     if not p.exists():
         return
-    linhas = [l for l in p.read_text(encoding="utf-8").splitlines()
-              if l.strip() and json.loads(l).get("fonte") != fonte]
+
+    def fica(linha: str) -> bool:
+        r = json.loads(linha)
+        return r.get("fonte") != fonte or (se is not None and not se(r))
+
+    linhas = [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip() and fica(l)]
     sandbox.escrever_texto(p, "".join(l + "\n" for l in linhas))
 
 

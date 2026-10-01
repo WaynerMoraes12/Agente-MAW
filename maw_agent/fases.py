@@ -9,8 +9,8 @@ from pathlib import Path
 
 import yaml
 
-from . import (achados, alvos, build, catalogo, config, estado, preflight, redacao, sandbox, saude, sondas,
-               suite, trava_appdata)
+from . import (achados, alvos, bancada, build, catalogo, config, e2e, estado, preflight, redacao, sandbox, saude,
+               sondas, suite, trava_appdata)
 from .cli import registrar
 
 
@@ -1385,6 +1385,193 @@ def _alvos_removidos(e: estado.Estado, hist_antes: dict) -> tuple[set[str], list
     return alvos.alvos_removidos(candidatos, atuais, origin), []
 
 
+# ---------- achado da E2E derrubado: a matriz e a bancada seguem o veredito ----------
+
+FONTE_VERIFICACAO = "verificacao"
+MARCA_DERRUBADO = "(achado derrubado na verificação adversarial)"
+# só as linhas que esta consolidação escreve (as de "verificacao" escritas à mão ficam)
+_RX_LINHA_DERRUBADO = re.compile(r"(?:^|: )o cenário \S+ mediu errado " + re.escape(MARCA_DERRUBADO))
+
+
+def _primeira_frase(texto: str, limite: int = 300) -> str:
+    """A primeira frase (até o primeiro . ! ou ? seguido de espaço ou do fim), sem quebras de linha."""
+    t = " ".join(str(texto or "").split())
+    m = re.match(r"(.+?[.!?])(?=\s|$)", t)
+    frase = (m.group(1) if m else t).strip()
+    return frase if len(frase) <= limite else frase[:limite - 1].rstrip() + "…"
+
+
+def motivo_derrubado(cenario: str, justificativa: str) -> str:
+    frase = _primeira_frase(justificativa)
+    return f"o cenário {cenario} mediu errado {MARCA_DERRUBADO}" + (f": {frase}" if frase else "")
+
+
+def derrubados_da_e2e(brutos: list[dict]) -> dict[tuple[str, str], dict]:
+    """(alvo, id do cenário) → {"motivo", "item"} de cada achado bruto da E2E com veredito 'derrubado'."""
+    out: dict[tuple[str, str], dict] = {}
+    for a in brutos:
+        assin = a.get("assinatura") or ""
+        veredito = a.get("veredito") or {}
+        if a.get("fonte") != "e2e" or veredito.get("resultado") != "derrubado" or not assin.startswith("e2e::"):
+            continue
+        cenario = assin[len("e2e::"):].split("::")[0]
+        for x in a.get("alvos") or []:
+            out[(x["alvo"], cenario)] = {"motivo": motivo_derrubado(cenario, veredito.get("justificativa", "")),
+                                         "item": a.get("item_catalogo")}
+    return out
+
+
+def _cenarios_declarados() -> tuple[dict[str, dict], list[str]]:
+    """{id: {"itens", "bancada", "mira_main"}} do que cada cenário de privado/cenarios declara (importa os
+    arquivos, não roda nada). Para passos gravados por uma fase e2e que ainda não guardava isso no passo."""
+    try:
+        return ({c.id: {"itens": list(c.itens), "bancada": list(c.bancada), "mira_main": e2e.cenario_mira_main(c)}
+                 for c in e2e.descobrir(config.PRIVADO / "cenarios")}, [])
+    except Exception as ex:
+        return {}, [f"achados da E2E derrubados: os cenários de privado/cenarios não puderam ser lidos ({ex}); "
+                    f"os itens e os códigos da bancada vieram do achado, do catálogo e de privado/bancada/mapa.yaml"]
+
+
+def _passo_e2e(passos: dict, alvo: str, cenario: str) -> dict | None:
+    p = passos.get(f"e2e:{alvo}:{cenario}")
+    return p if p and p.get("status") == "concluido" else None
+
+
+def _derrubado_vale(passos: dict, alvo: str, cenario: str) -> bool:
+    """O veredito vale para o que está na sprint: o passo do cenário ainda é o 'problema' que gerou o achado
+    (se ele rodou de novo e passou ou pulou, vale o que rodou). Passo ausente (tirado para refazer): vale."""
+    p = _passo_e2e(passos, alvo, cenario)
+    return p is None or (p.get("detalhe") or {}).get("estado") == "problema"
+
+
+def _aplicar_derrubados_na_matriz(pasta: Path, derrubados: dict, passos: dict, info: dict, itens_cat: list[dict],
+                                  alvos_lista: list[dict]) -> int:
+    """Cada célula 'falhou' gravada pela E2E para um cenário derrubado (no alvo do achado e nos alvos que
+    herdam a árvore dele) ganha uma linha 'nao_testavel' de fonte 'verificacao' com o motivo. Só a célula que
+    ainda é a do cenário (fonte e2e, 'falhou' e o motivo = a nota do passo) muda."""
+    res = catalogo.carregar_resultados(pasta)
+    n = 0
+    for (alvo, cenario), d in sorted(derrubados.items()):
+        if not _derrubado_vale(passos, alvo, cenario):
+            continue
+        p = _passo_e2e(passos, alvo, cenario)
+        det = (p or {}).get("detalhe") or {}
+        if "itens" in det:
+            itens = list(det["itens"])
+        elif cenario in info:
+            itens = info[cenario]["itens"]
+        else:
+            itens = sorted({d["item"]} | {it["id"] for it in itens_cat if cenario in (it.get("cenarios") or [])}
+                           - {None})
+        nota = det.get("nota") if p is not None else None
+        herdeiros = [b["nome"] for b in alvos_lista if b.get("compartilha_com") == alvo]
+        for item in itens:
+            for nome in [alvo, *herdeiros]:
+                cel = res.get((item, nome))
+                if not cel or cel.get("fonte") != "e2e" or cel.get("resultado") != "falhou":
+                    continue
+                if nome == alvo:
+                    esperado, motivo = (nota or None), d["motivo"]
+                else:
+                    esperado = f"mesma árvore de código de {alvo}" + (f": {nota}" if nota else "")
+                    motivo = f"mesma árvore de código de {alvo}: {d['motivo']}"
+                if p is not None and (cel.get("motivo") or None) != esperado:
+                    continue  # a célula é de outro cenário com o mesmo item
+                catalogo.registrar_resultado(pasta, item, nome, "nao_testavel", motivo, [], FONTE_VERIFICACAO)
+                res[(item, nome)] = {"item": item, "alvo": nome, "resultado": "nao_testavel", "motivo": motivo,
+                                     "achados": [], "fonte": FONTE_VERIFICACAO}
+                n += 1
+    return n
+
+
+def _onde_contribui(cenario: str, alvo: str, det: dict, info: dict, mapa: dict, codigo: str) -> str | None:
+    """Com que alvo o passo `e2e:<alvo>:<cenario>` entrou no código `codigo` da bancada (None: não entrou) —
+    a mesma regra de `fase_e2e._alvo_para_bancada`: cenário que mira main só conta na execução em main."""
+    if "bancada" in det:  # gravado pela própria fase e2e
+        return det.get("bancada_alvo") if codigo in (det.get("bancada") or []) else None
+    if cenario in info:
+        if codigo not in info[cenario]["bancada"]:
+            return None
+        mira_main = info[cenario]["mira_main"]
+    else:
+        m = mapa.get(codigo) or {}
+        if cenario not in (m.get("cenarios") or []):
+            return None
+        mira_main = m.get("onde") != "proxima"
+    return alvo if (alvo == "main" or not mira_main) else None
+
+
+def _codigos_do_cenario(cenario: str, det: dict, info: dict, mapa: dict) -> list[str]:
+    if "bancada" in det:
+        return list(det.get("bancada") or [])
+    if cenario in info:
+        return list(info[cenario]["bancada"])
+    return [c for c, m in mapa.items() if cenario in ((m or {}).get("cenarios") or [])]
+
+
+def _refazer_bancada(pasta: Path, derrubados: dict, passos: dict, info: dict, mapa: dict) -> list[str]:
+    """Refaz, pela regra de sempre (o pior vence, notas juntas), cada código da bancada alimentado por um
+    cenário derrubado, a partir do resultado de cada cenário no estado da sprint — o derrubado entra como
+    'pulei' com o motivo. Também refaz o código que uma consolidação anterior refez e já não precisa (o
+    veredito mudou): ele volta a ser o que a E2E registrou."""
+    afetados: set[str] = set()
+    for (alvo, cenario) in derrubados:
+        p = _passo_e2e(passos, alvo, cenario)
+        det = (p or {}).get("detalhe") or {}
+        for codigo in _codigos_do_cenario(cenario, det, info, mapa):
+            if p is not None and _onde_contribui(cenario, alvo, det, info, mapa, codigo) is not None:
+                afetados.add(codigo)
+    afetados |= {c for c, r in bancada.carregar(pasta).items() if MARCA_DERRUBADO in ((r or {}).get("nota") or "")}
+    refeitos = []
+    for codigo in sorted(afetados):
+        contrib = []
+        for chave, p in passos.items():
+            if not chave.startswith("e2e:") or p.get("status") != "concluido" or chave.count(":") < 2:
+                continue
+            _, alvo, cenario = chave.split(":", 2)
+            det = p.get("detalhe") or {}
+            alvo_b = _onde_contribui(cenario, alvo, det, info, mapa, codigo)
+            if alvo_b is None or det.get("estado") not in bancada.ESTADOS:
+                continue
+            est, nota = det["estado"], det.get("nota") or ""
+            if est == "problema" and (alvo, cenario) in derrubados:
+                est, nota = "pulei", derrubados[(alvo, cenario)]["motivo"]
+            contrib.append((p.get("fim") or p.get("inicio") or "", (est, nota, alvo_b)))
+        contrib.sort(key=lambda x: x[0])  # a ordem em que a E2E registrou
+        if bancada.reconstruir(pasta, codigo, [c for _, c in contrib]) is not None:
+            refeitos.append(codigo)
+    return refeitos
+
+
+def aplicar_derrubados_da_e2e(pasta: Path, brutos: list[dict]) -> tuple[dict, list[str]]:
+    """O veredito 'derrubado' de um achado da E2E (o cenário mediu errado) chega à matriz e à bancada: as
+    células 'falhou' do cenário viram 'nao_testavel' e os códigos dele na bancada são refeitos sem o
+    'problema'. Idempotente: as linhas desta função são refeitas a cada consolidação (a limpeza é em
+    `_consolidar`, antes da matriz) e a bancada é refeita do estado da sprint."""
+    pasta = Path(pasta)
+    derrubados = derrubados_da_e2e(brutos)
+    passos = (_ler_json(pasta / "estado.json") or {}).get("passos") or {}
+    ja_refeitos = any(MARCA_DERRUBADO in ((r or {}).get("nota") or "") for r in bancada.carregar(pasta).values())
+    if not derrubados and not ja_refeitos:
+        return {"celulas": 0, "bancada": []}, []
+    # passos de uma fase e2e que ainda não gravava itens/bancada no passo (ou passo tirado para refazer):
+    # o que cada cenário declara vem dos próprios arquivos de cenário
+    precisa_info = (any(_passo_e2e(passos, a, c) is None for a, c in derrubados)
+                    or any("bancada" not in (p.get("detalhe") or {}) for k, p in passos.items()
+                           if k.startswith("e2e:") and p.get("status") == "concluido"))
+    info, mensagens = _cenarios_declarados() if precisa_info else ({}, [])
+    mapa_arq = config.PRIVADO / "bancada" / "mapa.yaml"
+    try:
+        mapa = (yaml.safe_load(mapa_arq.read_text(encoding="utf-8")) or {}) if mapa_arq.exists() else {}
+    except (OSError, yaml.YAMLError) as ex:
+        mapa = {}
+        mensagens.append(f"achados da E2E derrubados: {mapa_arq.name} ilegível ({ex})")
+    alvos_lista = (_ler_json(pasta / "alvos.json") or {}).get("alvos") or []
+    n = _aplicar_derrubados_na_matriz(pasta, derrubados, passos, info, _itens_catalogo(), alvos_lista)
+    codigos = _refazer_bancada(pasta, derrubados, passos, info, mapa) if (pasta / "bancada.json").exists() else []
+    return {"celulas": n, "bancada": codigos}, mensagens
+
+
 def _consolidar(args) -> int:
     """Idempotente: consolida sempre a partir do histórico como estava antes desta sprint
     (historico-antes.json, gravado na primeira execução) e reconstrói erros_agente.json."""
@@ -1398,6 +1585,9 @@ def _consolidar(args) -> int:
         sandbox.escrever_json(antes, achados.carregar_historico(config.HISTORICO))
     hist_antes = achados.carregar_historico(antes)
     catalogo.descartar_fonte(e.pasta, "consolidacao")
+    # as linhas que a consolidação anterior escreveu para achados da E2E derrubados (refeitas no fim)
+    catalogo.descartar_fonte(e.pasta, FONTE_VERIFICACAO,
+                             se=lambda l: bool(_RX_LINHA_DERRUBADO.search(l.get("motivo") or "")))
     entradas, sem_verificacao, erros_leitura = ler_brutos(e.pasta)
     brutos, invalidos = separar_validos(entradas)
     sem_verif = sum(1 for a in brutos if id(a) in sem_verificacao)
@@ -1407,8 +1597,8 @@ def _consolidar(args) -> int:
                                                    extras=[("automatico", derivadas)])
     removidos, erros_removidos = _alvos_removidos(e, hist_antes)
     sandbox.escrever_json(e.pasta / "reverificacoes.json", rever)
-    sandbox.escrever_json(e.pasta / "erros_agente.json",
-                          erros_leitura + invalidos + conflitos_rever + erros_removidos)
+    erros = erros_leitura + invalidos + conflitos_rever + erros_removidos
+    sandbox.escrever_json(e.pasta / "erros_agente.json", erros)
     # a promoção/rebaixamento de confiança pelo veredito já aconteceu em ler_brutos (spec §11.3)
     derrubados = [{"titulo": a["titulo"], "justificativa": a["veredito"].get("justificativa", "")}
                   for a in brutos if (a.get("veredito") or {}).get("resultado") == "derrubado"]
@@ -1431,9 +1621,13 @@ def _consolidar(args) -> int:
                 resultados[(a["item_catalogo"], x["alvo"])] = {"item": a["item_catalogo"], "alvo": x["alvo"],
                                                                "resultado": "falhou", "motivo": atual.get("motivo"),
                                                                "achados": ids, "fonte": "consolidacao"}
+    # depois dos 'falhou' acima: um achado confirmado de outra fonte no mesmo item continua mandando na célula
+    derrubados_e2e, erros_derrubados = aplicar_derrubados_da_e2e(e.pasta, brutos)
+    if erros_derrubados:
+        sandbox.escrever_json(e.pasta / "erros_agente.json", erros + erros_derrubados)
     detalhe = {"achados": len(lista), "derrubados": len(derrubados), "achados_invalidos": len(invalidos),
                "sem_verificacao_adversarial": sem_verif, "reverificacoes_automaticas": len(derivadas),
-               "alvos_removidos": sorted(removidos)}
+               "alvos_removidos": sorted(removidos), "derrubados_e2e": derrubados_e2e}
     e.concluir("consolidar", detalhe)
     return _saida(detalhe)
 
