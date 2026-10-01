@@ -424,3 +424,218 @@ def test_repeticoes_passam_quando_o_servidor_desliga_o_pipe(alvo_token):
     with _app(pasta, saida_em_pipe=True, ambiente_extra={"FAKE_DESLIGA_PIPE": "1"}) as app:
         ok, problemas, _ = servico.executar_checagem(app.base_url, chk, {}, token=app.token)
     assert ok, problemas
+
+
+# ---------- fase servico: alvo com token, %APPDATA%\MAW protegido ----------
+
+class Args:
+    def __init__(self, alvo=None):
+        self.alvo = alvo
+
+
+ITENS = ["servico/health", "servico/token", "servico/so-novo", "servico/pipe", "servico/eco"]
+
+
+@pytest.fixture
+def sprint(tmp_path, monkeypatch, alvo_token, dados_falsos):
+    pasta_falsa, porta = alvo_token
+    monkeypatch.setattr(config, "RELATORIOS", tmp_path / "relatorios")
+    monkeypatch.setattr(config, "ALVOS_DIR", tmp_path / "alvos")
+    monkeypatch.setattr(config, "WORK", tmp_path / "work")
+    monkeypatch.setattr(config, "FERRAMENTAS", tmp_path / "ferramentas")
+    monkeypatch.setattr(config, "PRIVADO", tmp_path / "privado")
+    monkeypatch.setattr(config, "CATALOGO", tmp_path / "privado" / "catalogo" / "funcionalidades.yaml")
+    monkeypatch.setattr(config, "APPDATA_MAW", dados_falsos / "MAW")
+    monkeypatch.setattr(config, "BACKUPS", tmp_path / "Local" / "AgenteMAW" / "backups")
+    monkeypatch.setattr(suite, "maw_aberta", lambda: False)
+    monkeypatch.setattr(servico, "PYTHON_SERVICO_PADRAO", Path(sys.executable))
+    monkeypatch.setattr(servico, "FFMPEG_BIN_PADRAO", tmp_path / "sem-ffmpeg")
+    config.APPDATA_MAW.mkdir()
+    (config.APPDATA_MAW / "MAW.settings").write_text("<original/>", encoding="utf-8")
+
+    for nome in ("main", "antigo"):
+        destino = config.ALVOS_DIR / nome
+        destino.mkdir(parents=True)
+        texto = (pasta_falsa / SCRIPT).read_text(encoding="utf-8")
+        if nome == "antigo":  # o mesmo servidor, sem a marca do token no script (e sem criar o arquivo)
+            texto = texto.replace('CABECALHO = "X-Teste-Token"', 'CABECALHO = "X-Teste-" + "Token"')
+            texto = texto.replace('if os.environ.get("FAKE_CRIA_AO_SUBIR", "1") == "1":', "if False:")
+        (destino / SCRIPT).write_text(texto, encoding="utf-8")
+
+    itens = [{"id": i, "area": "servico", "titulo": "t", "descricao": "d", "origem": ["x"],
+              "verificacao": ["servico"], "cenarios": [], "requisitos": [], "marco": "M4"} for i in ITENS]
+    sandbox.criar_pasta(config.CATALOGO.parent)
+    sandbox.escrever_texto(config.CATALOGO, yaml.safe_dump(itens, allow_unicode=True))
+    cenarios = tmp_path / "privado" / "cenarios" / "servico.yaml"
+    sandbox.criar_pasta(cenarios.parent)
+    monkeypatch.setattr(fase_servico, "CAMINHO_CENARIOS", cenarios)
+    _cenarios({})
+
+    e = estado.nova_sprint(config.RELATORIOS)
+    monkeypatch.setattr(fase_servico, "_sprint_atual", lambda: estado.carregar(e.pasta))
+    sandbox.escrever_json(e.pasta / "alvos.json", {"alvos": [
+        {"nome": n, "branch": n, "ref": f"origin/{n}", "commit": COMMIT, "origem": "github", "assinatura": "s",
+         "compartilha_com": None} for n in ("main", "antigo")], "avisos": []})
+    return e
+
+
+def _cenarios(extra: dict) -> None:
+    base = {
+        "script": SCRIPT,
+        "token": {"marca_no_script": CABECALHO, "cabecalho": CABECALHO, "arquivo": ARQUIVO,
+                  "cabecalho_nonce": NONCE, "campo_prova": "prova", "rota_gatilho": "/"},
+        "variaveis": [{"nome": "FAKE_VARIAVEL_NOVA", "valor": "{pasta_alvo}", "requer_token": True}],
+        "checagens": [
+            {"id": "health", "rota": "/health", "status_esperado": 200, "chaves_esperadas": ["ok"],
+             "itens_catalogo": ["servico/health"]},
+            {"id": "sem-token", "rota": "/rota", "metodo": "POST", "corpo": {}, "token": "sem",
+             "status_esperado": 401, "itens_catalogo": ["servico/token"], "requer_token": True},
+            {"id": "prova", "rota": "/health", "nonce": "aleatorio", "itens_catalogo": ["servico/so-novo"],
+             "requer_token": True},
+            {"id": "pipe", "rota": "/barulhento", "repeticoes": 30, "timeout": 2, "saida_em_pipe": True,
+             "itens_catalogo": ["servico/pipe"], "requer_token": True},
+        ],
+        "comandos": [], "portas": [], "nao_testavel": [],
+    }
+    base.update(extra)
+    sandbox.escrever_texto(fase_servico.CAMINHO_CENARIOS, yaml.safe_dump(base, allow_unicode=True))
+
+
+def _resultados(e):
+    return catalogo.carregar_resultados(e.pasta)
+
+
+def _limitacoes(e) -> list[str]:
+    p = e.pasta / "limitacoes-servico.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+
+
+def test_fase_alvo_com_token_roda_as_checagens_novas_e_restaura_o_appdata(sprint):
+    e = sprint
+    fase_servico.cmd_servico(Args())
+    r = _resultados(e)
+    assert r[("servico/health", "main")]["resultado"] == "passou"
+    assert r[("servico/token", "main")]["resultado"] == "passou"
+    assert r[("servico/so-novo", "main")]["resultado"] == "passou"
+    # o servidor falso não desliga o pipe: a checagem de pipe acusa (é o que ela existe para fazer)
+    assert r[("servico/pipe", "main")]["resultado"] == "falhou"
+    # o token que o servidor criou não ficou: o %APPDATA%\MAW voltou ao que era, conferido
+    assert not (config.APPDATA_MAW / "token-do-servico").exists()
+    assert (config.APPDATA_MAW / "MAW.settings").read_text(encoding="utf-8") == "<original/>"
+    assert not (e.pasta / fases.BANDEIRA).exists()
+    regs = estado.carregar(e.pasta).restauracoes
+    assert len(regs) == 1 and regs[0]["quem"] == "servico" and regs[0]["verificado"] and regs[0]["backup_apagado"]
+    assert fases._situacao_do_ambiente(estado.carregar(e.pasta)) == (True, None)
+    dados = estado.carregar(e.pasta).dados("servico:main")
+    assert dados["usa_token"] is True and dados["token"] == {"existia_antes": False, "lido": True}
+
+
+def test_fase_alvo_antigo_sem_token_roda_como_antes_e_o_novo_nao_se_aplica(sprint):
+    e = sprint
+    fase_servico.cmd_servico(Args(alvo="antigo"))
+    r = _resultados(e)
+    assert r[("servico/health", "antigo")]["resultado"] == "passou"
+    for item in ("servico/token", "servico/so-novo", "servico/pipe"):
+        assert r[(item, "antigo")]["resultado"] == "na", item
+        assert "não usa o token" in r[(item, "antigo")]["motivo"]
+    # sem backup nem restauração: o alvo antigo nunca mexe no %APPDATA%\MAW
+    assert estado.carregar(e.pasta).restauracoes == []
+    assert not config.BACKUPS.exists() or not any(config.BACKUPS.iterdir())
+    captura = json.loads((config.ALVOS_DIR / "antigo" / "captura.json").read_text(encoding="utf-8"))
+    assert "FAKE_VARIAVEL_NOVA" not in captura["env"]  # variável 'requer_token' só no alvo com token
+    assert estado.carregar(e.pasta).dados("servico:antigo")["usa_token"] is False
+
+
+def test_fase_variavel_requer_token_chega_ao_alvo_com_token(sprint):
+    fase_servico.cmd_servico(Args(alvo="main"))
+    captura = json.loads((config.ALVOS_DIR / "main" / "captura.json").read_text(encoding="utf-8"))
+    assert captura["env"]["FAKE_VARIAVEL_NOVA"] == str(config.ALVOS_DIR / "main")
+
+
+def test_fase_token_que_ja_existia_continua_igual(sprint, dados_falsos):
+    (config.APPDATA_MAW / "token-do-servico").write_text("cd" * 32, encoding="ascii")
+    fase_servico.cmd_servico(Args(alvo="main"))
+    assert (config.APPDATA_MAW / "token-do-servico").read_text(encoding="ascii") == "cd" * 32
+    assert estado.carregar(sprint.pasta).dados("servico:main")["token"]["existia_antes"] is True
+
+
+def test_fase_token_nunca_vai_para_evidencia_achado_resultado_ou_estado(sprint, dados_falsos, monkeypatch):
+    e = sprint
+    vistos = {}
+    original = servico.ler_token
+
+    def espiar(caminho):
+        v = original(caminho)
+        if v:
+            vistos["token"] = v
+        return v
+
+    monkeypatch.setattr(servico, "ler_token", espiar)
+    _cenarios({"checagens": [{"id": "eco", "rota": "/eco-token", "status_esperado": 200,
+                              "itens_catalogo": ["servico/eco"]}]})
+    fase_servico.cmd_servico(Args(alvo="main"))
+    assert vistos.get("token")
+    assert _resultados(e)[("servico/eco", "main")]["resultado"] == "falhou"
+    for arq in e.pasta.rglob("*"):
+        if arq.is_file():
+            assert vistos["token"] not in arq.read_text(encoding="utf-8", errors="replace"), arq
+
+
+def test_fase_trava_ocupada_nao_roda_e_fica_nao_testavel(sprint, monkeypatch):
+    e = sprint
+    monkeypatch.setattr(trava_appdata, "adquirir", lambda *a, **k: None)
+    fase_servico.cmd_servico(Args(alvo="main"))
+    r = _resultados(e)
+    assert r[("servico/health", "main")]["resultado"] == "nao_testavel"
+    assert "trava" in r[("servico/health", "main")]["motivo"]
+    assert not (config.ALVOS_DIR / "main" / "captura.json").exists()  # o serviço nem subiu
+    assert estado.carregar(e.pasta).restauracoes == []
+    assert any("trava" in l for l in _limitacoes(e))
+
+
+def test_fase_maw_aberta_nao_roda_o_alvo_com_token(sprint, monkeypatch):
+    e = sprint
+    monkeypatch.setattr(suite, "maw_aberta", lambda: True)
+    fase_servico.cmd_servico(Args(alvo="main"))
+    r = _resultados(e)
+    assert r[("servico/token", "main")]["resultado"] == "nao_testavel"
+    assert "MAW aberta" in r[("servico/token", "main")]["motivo"]
+    assert not (config.ALVOS_DIR / "main" / "captura.json").exists()
+
+
+def test_fase_restaura_pendencia_antiga_antes_do_backup(sprint):
+    e = sprint
+    backup = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
+    sandbox.escrever_json(e.pasta / fases.BANDEIRA, {"backup": str(backup), "desde": "2026-09-01T00:00:00"})
+    (config.APPDATA_MAW / "MAW.settings").write_text("<sujo/>", encoding="utf-8")
+    fase_servico.cmd_servico(Args(alvo="main"))
+    assert (config.APPDATA_MAW / "MAW.settings").read_text(encoding="utf-8") == "<original/>"
+    assert fases._situacao_do_ambiente(estado.carregar(e.pasta)) == (True, None)
+
+
+def test_fase_token_ilegivel_deixa_as_checagens_que_precisam_dele_nao_testaveis(sprint, monkeypatch):
+    e = sprint
+    _cenarios({"variaveis": [{"nome": "FAKE_CRIA_AO_SUBIR", "valor": "0"},
+                             {"nome": "FAKE_NUNCA_CRIA", "valor": "1"}]})
+    fase_servico.cmd_servico(Args(alvo="main"))
+    r = _resultados(e)
+    assert r[("servico/so-novo", "main")]["resultado"] == "nao_testavel"  # a prova precisa do token
+    assert r[("servico/token", "main")]["resultado"] == "passou"          # 'sem token' não precisa dele
+    brutos = e.pasta / "achados-brutos"
+    assert not (brutos.exists() and list(brutos.glob("*prova*")))
+    assert any("token" in l and "não pôde ser lido" in l for l in _limitacoes(e))
+
+
+def test_fase_pasta_do_token_fora_do_backup_apaga_o_token_novo(sprint, tmp_path, monkeypatch):
+    """A pasta que o shell dá (onde o serviço grava o token) não é a do %APPDATA% do ambiente (a do
+    backup): o token que o serviço criou é apagado no fim, e a pasta que não existia também."""
+    e = sprint
+    outra = tmp_path / "OutraRoaming"
+    outra.mkdir()
+    monkeypatch.setattr(servico, "pasta_de_dados_do_usuario", lambda: outra)
+    monkeypatch.setenv("FAKE_PASTA_DADOS", str(outra))
+    fase_servico.cmd_servico(Args(alvo="main"))
+    assert not (outra / ARQUIVO).exists()
+    assert not (outra / "MAW").exists()
+    assert _resultados(e)[("servico/token", "main")]["resultado"] == "passou"
+    assert any("fora do backup" in l for l in _limitacoes(e))

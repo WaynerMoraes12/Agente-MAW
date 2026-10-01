@@ -15,20 +15,36 @@ mostra a escolha de cada um, sem montar nada).
 
 Nunca lê, imprime nem grava a chave de API do serviço de IA: a rota de "pedir um texto gerado" só
 é exercitada pelos erros de validação documentados no YAML privado (nunca chega a chamar o
-provedor de verdade), e o ambiente do processo filho nunca carrega nenhuma variável cujo nome
-pareça uma credencial (`servico._ambiente_sem_segredos`, regra genérica, sem nome de variável
-específico em lugar nenhum do código). O restante fica `nao_testavel`, documentado no YAML privado.
+provedor de verdade), e o ambiente do processo filho nunca carrega nenhuma variável do agente cujo
+nome pareça uma credencial (`servico._ambiente_sem_segredos`, regra genérica, sem nome de variável
+específico em lugar nenhum do código) — só as `variaveis` do YAML privado entram por cima, com valor
+forjado (um valor com cara de credencial de verdade é recusado ao carregar). O restante fica
+`nao_testavel`, documentado no YAML privado.
 
 Uma porta já ocupada por outro processo nunca vira um defeito do alvo: o agente não inicia nada
 nesse caso, não mexe no processo que já está lá, e registra a situação como `nao_testavel`.
+
+Alvo cujo script usa o token de quem chama (`token:` do YAML privado): o serviço dele grava o token
+num arquivo do %APPDATA%\\MAW real do usuário. Por isso esse alvo roda cercado como a suíte: trava do
+%APPDATA%\\MAW → (MAW fechada, pendências restauradas) → backup → bandeira `appdata-sujo.json` →
+serviço e checagens → restauração conferida (`fases._restaurar_ambiente`, que `sprint encerrar`
+confere). Toda checagem leva o token, a menos que peça outra coisa; o token nunca vai para evidência,
+achado, resultado nem estado (`servico.redigir`). As checagens `requer_token` são `na` num alvo
+sem token, e as variáveis `requer_token` do YAML só entram no ambiente do serviço de um alvo com
+token: um alvo antigo roda exatamente como antes, sem tocar no %APPDATA%\\MAW.
 """
 from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
 
-from . import achados, catalogo, config, estado, redacao, sandbox, servico
+from . import achados, catalogo, config, estado, fases, sandbox, servico, suite, trava_appdata
 from .cli import registrar
+
+_MOTIVO_NA = ("o script do serviço deste alvo não usa o token de quem chama: a funcionalidade não existe "
+              "neste alvo")
+_MOTIVO_MAW_ABERTA = ("MAW aberta: o serviço de um alvo com token grava no %APPDATA%\\MAW e só roda com a MAW "
+                      "fechada — feche-a e rode `MA servico` de novo")
 
 CAMINHO_CENARIOS = config.PRIVADO / "cenarios" / "servico.yaml"
 
@@ -91,7 +107,7 @@ def cobertura(itens_servico: set[str], dados_cenarios: dict) -> tuple[set[str], 
 
 def _evidencia(e: estado.Estado, nome_alvo: str, chk_id: str, detalhe: dict) -> str:
     caminho = e.pasta / "evidencias" / "servico" / f"{nome_alvo}-{chk_id}.json"
-    texto = redacao.redigir(json.dumps(detalhe, ensure_ascii=False, indent=2))
+    texto = servico.redigir(json.dumps(detalhe, ensure_ascii=False, indent=2))
     sandbox.escrever_texto(caminho, texto)
     return f"evidencias/servico/{nome_alvo}-{chk_id}.json"
 
@@ -140,7 +156,7 @@ def achado_de_checagem(chk_id: str, rota: str, metodo: str, principio: str | Non
         "item_catalogo": item_catalogo, "principio": principio,
         "passos": [f"subir {nome_script} ({_rel(python)}, com o ffmpeg e os executáveis do ambiente no PATH) e "
                   f"mandar {metodo} {rota} com o corpo do cenário '{chk_id}' (privado/cenarios/servico.yaml)"],
-        "esperado": esperado or "ver privado/cenarios/servico.yaml", "obtido": redacao.redigir(obtido),
+        "esperado": esperado or "ver privado/cenarios/servico.yaml", "obtido": servico.redigir(obtido),
         "evidencias": [{"arquivo": caminho_evidencia, "legenda": f"resposta de {chk_id}", "embutir": False}],
         "causa_provavel": None, "sugestao": "corrigir o serviço até a resposta bater com o contrato documentado",
         "criterio_aceite": esperado or "a resposta bate com o contrato documentado em servico.yaml",
@@ -162,7 +178,7 @@ def achado_de_comando(chk, alvo: dict, saida: str, codigo: int | None, python: P
         "item_catalogo": item_principal, "principio": None,
         "passos": [f"{_rel(python)} {' '.join(chk.argumentos)} (cwd={alvo['nome']})"],
         "esperado": chk.esperado or f"código de saída {chk.codigo_esperado}",
-        "obtido": redacao.redigir(f"{contexto}código de saída {codigo}: {resumo}"),
+        "obtido": servico.redigir(f"{contexto}código de saída {codigo}: {resumo}"),
         "evidencias": [], "causa_provavel": None,
         "sugestao": "corrigir as dependências do serviço até o comando funcionar",
         "criterio_aceite": chk.esperado or f"o comando sai com código {chk.codigo_esperado}",
@@ -230,16 +246,38 @@ def _acumular(agregados: dict[str, list[tuple[bool, str]]], itens: list[str], ok
         agregados.setdefault(item, []).append((ok, motivo))
 
 
-def _rodar_checagens_http(e: estado.Estado, alvo: dict, app: "servico.ServicoApp", checagens: list,
+def _motivo_sem_token(app) -> str:
+    return (f"o token de quem chama não pôde ser lido do arquivo do serviço deste alvo "
+            f"({app.token_caminho}): a checagem precisa dele")
+
+
+def _rodar_checagens_http(e: estado.Estado, alvo: dict, app: "servico.ServicoApp | None", checagens: list,
                           contexto: dict[str, str], agregados: dict[str, list[tuple[bool, str]]],
-                          nome_script: str, ambiente=None, nao_testaveis: dict[str, str] | None = None) -> list[dict]:
+                          nome_script: str, ambiente=None, nao_testaveis: dict[str, str] | None = None,
+                          com_token: bool = False, nao_se_aplica: dict[str, str] | None = None) -> list[dict]:
+    """`com_token`: o script do alvo usa o token — toda checagem leva `app.token`; senão as
+    `requer_token` vão para `nao_se_aplica` (`na`) sem pedido nenhum (e `app` pode ser None)."""
     resumo = []
     nao_testaveis = {} if nao_testaveis is None else nao_testaveis
+    nao_se_aplica = {} if nao_se_aplica is None else nao_se_aplica
     for chk in checagens:
+        if chk.requer_token and not com_token:
+            for item in chk.itens_catalogo:
+                nao_se_aplica.setdefault(item, _MOTIVO_NA)
+            resumo.append({"id": chk.id, "ok": None, "na": _MOTIVO_NA})
+            continue
+        token = app.token if com_token else None
+        if com_token and servico.precisa_do_token(chk) and not (token and token.valor):
+            motivo = _motivo_sem_token(app)
+            for item in chk.itens_catalogo:
+                nao_testaveis.setdefault(item, motivo)
+            resumo.append({"id": chk.id, "ok": None, "nao_testavel": motivo})
+            continue
         try:
-            ok, problemas, detalhe = servico.executar_checagem(app.base_url, chk, contexto)
+            ok, problemas, detalhe = servico.executar_checagem(app.base_url, chk, contexto, token=token)
         except Exception as ex:  # a checagem nunca pode derrubar a fase inteira
-            ok, problemas, detalhe = False, [f"a checagem levantou uma exceção: {ex}"], {"excecao": str(ex)}
+            ok, problemas = False, [servico.redigir(f"a checagem levantou uma exceção: {ex}")]
+            detalhe = {"excecao": servico.redigir(str(ex))}
         motivo = "; ".join(problemas)
         fora = None if ok else _fora_do_ambiente(ambiente, chk.depende_do_ambiente)
         if fora:
@@ -285,7 +323,7 @@ def _rodar_comandos(e: estado.Estado, alvo: dict, comandos: list,
             continue
         _acumular(agregados, chk.itens_catalogo, ok, "; ".join(problemas))
         if not ok:
-            achado = achado_de_comando(chk, alvo, redacao.redigir(texto), codigo, python, ambiente)
+            achado = achado_de_comando(chk, alvo, servico.redigir(texto), codigo, python, ambiente)
             _escrever_achado_validado(e, f"servico-{alvo['nome']}-{chk.id}.json", achado)
         resumo.append({"id": chk.id, "ok": ok, "codigo": codigo})
     return resumo
@@ -332,7 +370,12 @@ def _rodar_portas(e: estado.Estado, alvo: dict, portas: list, agregados: dict[st
 
 
 def _registrar_agregados(e: estado.Estado, nome_alvo: str, agregados: dict[str, list[tuple[bool, str]]],
-                        nao_testaveis: dict[str, str] | None = None) -> None:
+                        nao_testaveis: dict[str, str] | None = None,
+                        nao_se_aplica: dict[str, str] | None = None) -> None:
+    # item cujas checagens são todas de um recurso que este alvo não tem (`requer_token` num alvo sem token)
+    for item, motivo in (nao_se_aplica or {}).items():
+        if item not in agregados and item not in (nao_testaveis or {}):
+            catalogo.registrar_resultado(e.pasta, item, nome_alvo, "na", motivo, fonte="servico")
     # item cuja única checagem ficou não testável (fora do ambiente do alvo, documentação sem porta)
     for item, motivo in (nao_testaveis or {}).items():
         if item not in agregados:
@@ -379,34 +422,193 @@ def _servico_de_um_alvo(e: estado.Estado, alvo: dict, dados_cenarios: dict, iten
         resultado["motivo"] = motivo_indisponivel
         e.concluir(passo, resultado)
         return resultado
+    com_token = servico.usa_token(pasta_alvo / nome_script, dados_cenarios.get("token"))
+    resultado["usa_token"] = com_token
+
+    def rodar() -> None:
+        _rodar_no_alvo(e, alvo, dados_cenarios, itens_servico, ambiente, resultado, com_token)
+
+    if not com_token:
+        rodar()  # alvo sem token: exatamente como sempre foi, sem tocar no %APPDATA%\MAW
+    else:
+        recusa, restauracao = _com_appdata_protegido(e, rodar)
+        if recusa is not None:
+            _nao_rodou(e, nome, itens_servico, recusa, resultado)
+        else:
+            resultado["ambiente_restaurado"] = restauracao["verificado"]
+            if not restauracao["verificado"]:
+                resultado["ok"] = False
+                _acrescentar_limitacoes(e, "servico", [
+                    f"{nome}: o %APPDATA%\\MAW não foi restaurado depois do serviço: "
+                    f"{restauracao.get('erro') or 'sem mensagem de erro'}"])
+    e.concluir(passo, resultado)
+    return resultado
+
+
+def _nao_rodou(e: estado.Estado, nome: str, itens_servico: set[str], motivo: str, resultado: dict) -> None:
+    """O serviço do alvo nem subiu por um motivo do ambiente do agente (nunca defeito do alvo)."""
+    for item in itens_servico:
+        catalogo.registrar_resultado(e.pasta, item, nome, "nao_testavel", motivo, fonte="servico")
+    _acrescentar_limitacoes(e, "servico", [f"{motivo} — fase servico não rodou para {nome}"])
+    resultado["ok"] = False
+    resultado["motivo"] = motivo
+
+
+def _com_appdata_protegido(e: estado.Estado, rodar) -> tuple[str | None, dict | None]:
+    """Roda `rodar()` como a suíte roda a MAW: com a trava do %APPDATA%\\MAW do começo ao fim, só com
+    a MAW fechada e o ambiente limpo (pendências antigas restauradas antes), backup → bandeira →
+    `rodar()` → restauração conferida (registrada no estado da sprint). Devolve (motivo de não ter
+    rodado — nada foi tocado —, None) ou (None, registro da restauração)."""
+    posse = trava_appdata.adquirir(fases.ESPERA_TRAVA_APPDATA)
+    if posse is None:
+        return (f"outra sessão do agente usou a MAW por mais de {fases.ESPERA_TRAVA_APPDATA:g} s (trava do "
+                "%APPDATA%\\MAW ocupada): o serviço do alvo com token não rodou"), None
+    try:
+        if suite.maw_aberta():
+            return _MOTIVO_MAW_ABERTA, None
+        fases.restaurar_pendencias_ambiente("servico", e)
+        sujas = fases.pendencias_ambiente()
+        if sujas:
+            return (f"restauração pendente do %APPDATA%\\MAW ({', '.join(map(fases._descrever_bandeira, sujas))}) "
+                    "não foi concluída: o serviço de um alvo com token não roda sobre um ambiente sujo"), None
+        try:
+            backup = sandbox.backup_pasta(config.APPDATA_MAW, config.BACKUPS)
+        except OSError as ex:
+            return f"não foi possível fazer o backup do %APPDATA%\\MAW: {servico.redigir(str(ex))}", None
+        try:
+            sandbox.escrever_json(e.pasta / fases.BANDEIRA, {"backup": str(backup), "desde": fases._agora()})
+            rodar()
+        finally:
+            restauracao = fases._restaurar_ambiente(e, backup, "servico")
+        return None, restauracao
+    finally:
+        posse.liberar()
+
+
+def _apagar_token_fora_do_backup(e: estado.Estado, nome: str, app: "servico.ServicoApp") -> None:
+    """O arquivo do token fica onde o shell diz que é a pasta de dados do usuário; se ela não é a do
+    backup (%APPDATA%\\MAW do ambiente), a restauração não o alcança: o token que não existia antes
+    é apagado aqui (e a pasta dele, se também não existia), e conferido."""
+    caminho = app.token_caminho
+    if caminho is None or servico.dentro_de(caminho, config.APPDATA_MAW):
+        return
+    _acrescentar_limitacoes(e, "servico", [
+        f"{nome}: o token do serviço fica fora do backup do %APPDATA%\\MAW ({caminho.parent}): o agente "
+        "apaga o que o serviço criou ali, em vez de restaurar"])
+    if app.token_existia:
+        return
+    try:
+        if caminho.exists():
+            sandbox.remover(caminho)
+        pasta = caminho.parent
+        if not app.pasta_token_existia and pasta.is_dir() and not any(pasta.iterdir()):
+            sandbox.remover(pasta)
+    except OSError as ex:
+        _acrescentar_limitacoes(e, "servico", [f"{nome}: não deu para apagar o token criado pelo serviço: "
+                                               f"{servico.redigir(str(ex))}"])
+        return
+    if caminho.exists():
+        _acrescentar_limitacoes(e, "servico", [f"{nome}: o token criado pelo serviço continua em {caminho}"])
+
+
+def _rodar_checagens_em_pipe(e: estado.Estado, alvo: dict, checagens: list, contexto: dict[str, str],
+                             agregados: dict, nome_script: str, ambiente, nao_testaveis: dict, com_token: bool,
+                             nao_se_aplica: dict, abrir) -> list[dict]:
+    """As checagens `saida_em_pipe` rodam num segundo serviço, com a saída num pipe que ninguém lê.
+    Num alvo sem token as `requer_token` são `na` sem subir nada."""
+    aplicaveis = [c for c in checagens if com_token or not c.requer_token]
+    resumo = _rodar_checagens_http(e, alvo, None, [c for c in checagens if c not in aplicaveis], contexto,
+                                   agregados, nome_script, ambiente, nao_testaveis, com_token, nao_se_aplica)
+    if not aplicaveis:
+        return resumo
+    try:
+        with abrir(saida_em_pipe=True) as app:
+            resumo += _rodar_checagens_http(e, alvo, app, aplicaveis, {**contexto, "porta": str(app.porta)},
+                                            agregados, nome_script, ambiente, nao_testaveis, com_token,
+                                            nao_se_aplica)
+    except servico.PortaOcupada as ex:
+        motivo = servico.redigir(str(ex))
+        for chk in aplicaveis:
+            for item in chk.itens_catalogo:
+                nao_testaveis.setdefault(item, motivo)
+            resumo.append({"id": chk.id, "ok": None, "nao_testavel": motivo})
+    except servico.ServicoIndisponivel as ex:
+        problemas = [f"o serviço não subiu com a saída num pipe que ninguém lê: {servico.redigir(str(ex))}"]
+        for chk in aplicaveis:
+            _acumular(agregados, chk.itens_catalogo, False, problemas[0])
+            evidencia = _evidencia(e, alvo["nome"], chk.id, {"excecao": problemas[0]})
+            item_principal = chk.itens_catalogo[0] if chk.itens_catalogo else "servico/geral"
+            achado = achado_de_checagem(chk.id, chk.rota, chk.metodo, chk.principio, chk.esperado, item_principal,
+                                        alvo, problemas, evidencia, nome_script,
+                                        ambiente.python if ambiente is not None else None)
+            _escrever_achado_validado(e, f"servico-{alvo['nome']}-{chk.id}.json", achado)
+            resumo.append({"id": chk.id, "ok": False, "problemas": problemas})
+    return resumo
+
+
+def _rodar_no_alvo(e: estado.Estado, alvo: dict, dados_cenarios: dict, itens_servico: set[str], ambiente,
+                   resultado: dict, com_token: bool) -> None:
+    """Sobe o serviço do alvo, roda as checagens HTTP/comandos/portas e registra tudo em `resultado`
+    (e no catálogo/achados). Para um alvo sem token, é o que a fase sempre fez."""
+    nome = alvo["nome"]
+    pasta_alvo = config.ALVOS_DIR / nome
+    nome_script = dados_cenarios["script"]
+    python = ambiente.python
     pasta_trabalho = sandbox.criar_pasta(config.WORK / "execucao" / nome / "servico")
     contexto = _preparar_fixtures(pasta_trabalho)
+    cfg_token = dados_cenarios.get("token") if com_token else None
+    extra = servico.variaveis_do_processo(dados_cenarios.get("variaveis") or [], com_token,
+                                          {"pasta_alvo": str(pasta_alvo), "trabalho": str(pasta_trabalho)})
+    normais = [c for c in dados_cenarios["checagens"] if not c.saida_em_pipe]
+    em_pipe = [c for c in dados_cenarios["checagens"] if c.saida_em_pipe]
     agregados: dict[str, list[tuple[bool, str]]] = {}
     nao_testaveis: dict[str, str] = {}
+    nao_se_aplica: dict[str, str] = {}
+
+    def abrir(**kw) -> "servico.ServicoApp":
+        if not kw.get("saida_em_pipe"):
+            kw["log"] = pasta_trabalho / "servico.log"
+        return servico.ServicoApp(pasta_alvo, script=nome_script, python=python, ffmpeg=servico.FFMPEG_BIN_PADRAO,
+                                  ambiente_extra=extra or None, token=cfg_token, **kw)
+
     try:
-        with servico.ServicoApp(pasta_alvo, script=nome_script, python=python, ffmpeg=servico.FFMPEG_BIN_PADRAO,
-                                log=pasta_trabalho / "servico.log") as app:
-            resultado["porta"] = app.porta
-            resultado["saude"] = app.saude
-            resultado["checagens"] = _rodar_checagens_http(e, alvo, app, dados_cenarios["checagens"], contexto,
-                                                           agregados, nome_script, ambiente, nao_testaveis)
-            resultado["comandos"] = _rodar_comandos(e, alvo, dados_cenarios["comandos"], agregados, ambiente,
-                                                    nao_testaveis)
-            resultado["portas"] = _rodar_portas(e, alvo, dados_cenarios["portas"], agregados, nome_script,
-                                                app.porta, pasta_alvo, nao_testaveis)
-        _registrar_agregados(e, nome, agregados, nao_testaveis)
+        app = abrir()
+        try:
+            with app:
+                resultado["porta"] = app.porta
+                resultado["saude"] = app.saude
+                if cfg_token is not None:
+                    lido = bool(app.token and app.token.valor)
+                    resultado["token"] = {"existia_antes": app.token_existia, "lido": lido}
+                    if not lido:
+                        _acrescentar_limitacoes(e, "servico", [
+                            f"{nome}: o token de quem chama não pôde ser lido ({app.token_caminho}) depois do "
+                            "/health: as checagens que precisam dele ficaram não testáveis"])
+                ctx = {**contexto, "porta": str(app.porta)}
+                resultado["checagens"] = _rodar_checagens_http(e, alvo, app, normais, ctx, agregados, nome_script,
+                                                               ambiente, nao_testaveis, com_token, nao_se_aplica)
+                resultado["comandos"] = _rodar_comandos(e, alvo, dados_cenarios["comandos"], agregados, ambiente,
+                                                        nao_testaveis)
+                resultado["portas"] = _rodar_portas(e, alvo, dados_cenarios["portas"], agregados, nome_script,
+                                                    app.porta, pasta_alvo, nao_testaveis)
+            if em_pipe:
+                resultado["checagens"] += _rodar_checagens_em_pipe(
+                    e, alvo, em_pipe, contexto, agregados, nome_script, ambiente, nao_testaveis, com_token,
+                    nao_se_aplica, abrir)
+        finally:
+            _apagar_token_fora_do_backup(e, nome, app)
+        _registrar_agregados(e, nome, agregados, nao_testaveis, nao_se_aplica)
     except servico.PortaOcupada as ex:
         # nunca é defeito do alvo: o agente não iniciou nada, não mexeu em processo nenhum.
-        motivo = redacao.redigir(str(ex))
+        motivo = servico.redigir(str(ex))
         for item in itens_servico:
             catalogo.registrar_resultado(e.pasta, item, nome, "nao_testavel", motivo, fonte="servico")
         _acrescentar_limitacoes(e, "servico", [f"{motivo} — fase servico não rodou para {nome}"])
         resultado["ok"] = False
         resultado["motivo"] = motivo
-        e.concluir(passo, resultado)
-        return resultado
+        return
     except servico.ServicoIndisponivel as ex:
-        motivo = f"o serviço não respondeu a /health: {redacao.redigir(str(ex))}"
+        motivo = f"o serviço não respondeu a /health: {servico.redigir(str(ex))}"
         for item in itens_servico:
             catalogo.registrar_resultado(e.pasta, item, nome, "falhou", motivo, fonte="servico")
         achado = {
@@ -422,12 +624,9 @@ def _servico_de_um_alvo(e: estado.Estado, alvo: dict, dados_cenarios: dict, iten
         _escrever_achado_validado(e, f"servico-{nome}-indisponivel.json", achado)
         resultado["ok"] = False
         resultado["motivo"] = motivo
-        e.concluir(passo, resultado)
-        return resultado
+        return
     _registrar_nao_testavel(e, alvo, dados_cenarios["nao_testavel"])
     resultado["ok"] = True
-    e.concluir(passo, resultado)
-    return resultado
 
 
 def _herdar(e: estado.Estado, todos: list[dict]) -> None:
