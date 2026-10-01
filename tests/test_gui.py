@@ -966,3 +966,23 @@ def test_fracao_cor_dominante_distingue_janela_vazia_de_janela_com_conteudo():
     for y in range(40, 560, 40):
         d.rectangle((40, y, 760, y + 12), fill=(200, 180, 255))
     assert gui.fracao_cor_dominante(com_texto) < gui.LIMITE_CAPTURA_VAZIA
+
+
+def test_tecla_real_com_modificador_segura_o_ctrl_em_lote_proprio(monkeypatch):
+    """A JUCE lê os modificadores pelo estado físico (GetAsyncKeyState) quando trata a tecla: Ctrl↓ C↓ C↑ Ctrl↑ num
+    único SendInput chega como C sem Ctrl. O modificador desce num lote, a tecla em outro e o modificador sobe depois."""
+    lotes, pausas = [], []
+    monkeypatch.setattr(gui, "_enviar", lambda entradas: lotes.append(
+        [(e.u.ki.wVk, bool(e.u.ki.dwFlags & gui.KEYEVENTF_KEYUP)) for e in entradas]))
+    monkeypatch.setattr(gui.time, "sleep", lambda s: pausas.append(s))
+    gui._enviar_tecla_real(gui.interpretar_teclas("ctrl+c"))
+    assert lotes == [[(0x11, False)], [(ord("C"), False), (ord("C"), True)], [(0x11, True)]]
+    assert len(pausas) == 2 and all(p >= 0.03 for p in pausas)
+
+
+def test_tecla_real_sem_modificador_vai_num_lote_so(monkeypatch):
+    lotes = []
+    monkeypatch.setattr(gui, "_enviar", lambda entradas: lotes.append(len(entradas)))
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+    gui._enviar_tecla_real(gui.interpretar_teclas("t"))
+    assert lotes == [2]

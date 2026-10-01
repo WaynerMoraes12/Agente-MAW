@@ -698,17 +698,29 @@ def _enviar(entradas: list[INPUT]) -> None:
         raise ErroApp(f"SendInput recusou a entrada (erro {ctypes.get_last_error()})")
 
 
+PAUSA_MODIFICADOR = 0.04
+
+
 def _enviar_tecla_real(t: Tecla) -> None:
+    """A JUCE lê os modificadores pelo estado físico do teclado (GetAsyncKeyState) quando trata a tecla: num único
+    SendInput o Ctrl já subiu quando ela trata o C. O modificador desce num lote, a tecla vai noutro e ele sobe depois."""
     mods = list(t.modificadores)
     if t.precisa_shift and 0x10 not in mods:
         mods.append(0x10)
-    seq = [_tecla_input(m, False) for m in mods]
     if t.vk:
-        seq += [_tecla_input(t.vk, False), _tecla_input(t.vk, True)]
+        tecla = [_tecla_input(t.vk, False), _tecla_input(t.vk, True)]
     else:
-        seq += [_tecla_input(0, False, ord(t.caractere)), _tecla_input(0, True, ord(t.caractere))]
-    seq += [_tecla_input(m, True) for m in reversed(mods)]
-    _enviar(seq)
+        tecla = [_tecla_input(0, False, ord(t.caractere)), _tecla_input(0, True, ord(t.caractere))]
+    if not mods:
+        _enviar(tecla)
+        return
+    _enviar([_tecla_input(m, False) for m in mods])
+    try:
+        time.sleep(PAUSA_MODIFICADOR)
+        _enviar(tecla)
+        time.sleep(PAUSA_MODIFICADOR)
+    finally:  # o modificador nunca fica preso no teclado do usuário
+        _enviar([_tecla_input(m, True) for m in reversed(mods)])
 
 
 # ---------------------------------------------------------------- UI Automation
